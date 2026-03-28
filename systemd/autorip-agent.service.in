@@ -1,0 +1,21 @@
+[Unit]
+Description=Autorip API Agent
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/autorip-agent-venv/bin/gunicorn \
+    --bind 0.0.0.0:@@AGENT_PORT@@ \
+    --workers 2 \
+    --timeout 30 \
+    --chdir /usr/local/lib/autorip-agent \
+    app:app
+Restart=on-failure
+RestartSec=5
+
+# Runs as root so it can start/stop autorip systemd services
+# The agent only listens on the local network (no public exposure)
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

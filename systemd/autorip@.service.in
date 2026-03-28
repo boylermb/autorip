@@ -1,0 +1,30 @@
+[Unit]
+Description=Auto-rip disc in /dev/%i
+Wants=dev-%i.device
+After=dev-%i.device
+
+[Service]
+Type=oneshot
+User=autorip
+Group=autorip
+SupplementaryGroups=video render
+Environment=HOME=/var/lib/autorip
+ExecStart=/usr/local/bin/autorip.sh /dev/%i
+WorkingDirectory=/tmp
+StandardOutput=append:/var/log/autorip/%i.log
+StandardError=append:/var/log/autorip/%i.log
+TimeoutStartSec=14400
+Nice=10
+IOSchedulingClass=idle
+
+# Security hardening
+NoNewPrivileges=false
+ProtectSystem=strict
+ReadWritePaths=@@WRITABLE_PATHS@@ /var/lib/autorip /var/log/autorip /tmp
+PrivateTmp=true
+# Note: DeviceAllow is intentionally omitted.  MakeMKV probes all /dev/sg*
+# (SCSI generic) devices at startup to locate optical drives.  Any
+# DeviceAllow= directive activates the cgroup device controller which
+# denies access to unlisted devices, breaking MakeMKV's drive detection.
+# The autorip user is already unprivileged; file-level permissions on
+# /dev/sg* and /dev/sr* (group cdrom) provide sufficient access control.

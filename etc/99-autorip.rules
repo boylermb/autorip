@@ -1,0 +1,10 @@
+# /etc/udev/rules.d/99-autorip.rules
+# Installed by autorip — https://github.com/boylermb/autorip
+#
+# When an optical disc is inserted and the drive becomes ready,
+# start the autorip systemd service for that device.
+
+# Trigger on disc ready (change event with media present)
+# Use --no-block to avoid deadlocking the udev worker while systemd waits for device
+SUBSYSTEM=="block", KERNEL=="sr[0-9]*", ENV{ID_CDROM_MEDIA}=="1", ACTION=="change", \
+  RUN+="/usr/bin/systemctl start --no-block autorip@%k.service"

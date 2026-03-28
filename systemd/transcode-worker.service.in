@@ -1,0 +1,26 @@
+[Unit]
+Description=Autorip GPU Transcode Worker
+Documentation=https://github.com/boylermb/autorip
+After=network.target local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/transcode-worker.sh
+User=autorip
+Group=autorip
+Environment=HOME=/var/lib/autorip
+StandardOutput=append:/var/log/autorip/transcode-worker.log
+StandardError=append:/var/log/autorip/transcode-worker.log
+
+# Grant GPU access
+SupplementaryGroups=video render
+
+# Filesystem protections (allow NFS + GPU device access)
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=@@WRITABLE_PATHS@@ /var/lib/autorip /var/log/autorip /tmp
+PrivateTmp=true
+NoNewPrivileges=true
+
+# Allow the worker to run for a long time (large queues)
+TimeoutStartSec=infinity

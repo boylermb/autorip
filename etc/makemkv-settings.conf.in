@@ -1,0 +1,22 @@
+# MakeMKV settings
+# Installed by autorip — https://github.com/boylermb/autorip
+# ~/.MakeMKV/settings.conf for the autorip user
+#
+# Selection profile: include all audio and subtitle tracks by default
+# This ensures DVD/Blu-ray rips always contain audio streams.
+
+# Selection string: select all video, all audio, and all subtitles
+app_DefaultSelectionString = "+sel:all"
+
+# Preferred output language (English first, but keep all)
+app_PreferredLanguage = "eng"
+
+# Minimum title length in seconds (matches MIN_TITLE_SECONDS in autorip.conf)
+app_MinimumTitleLength = "@@MIN_TITLE_SECONDS@@"
+
+# Use MakeMKV's built-in decryption (LibreDrive when available)
+dvd_MinimumTitleLength = "@@MIN_TITLE_SECONDS@@"
+
+# Expert mode settings for audio handling
+# Ensure AC3/DTS and other audio codecs are preserved in the MKV container
+app_UpdateEnable = "0"

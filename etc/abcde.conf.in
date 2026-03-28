@@ -1,0 +1,51 @@
+# /etc/abcde.conf - Audio CD ripping configuration
+# Installed by autorip — https://github.com/boylermb/autorip
+
+# ---------- Output format ----------
+OUTPUTTYPE="@@CD_FORMAT@@"
+OUTPUTDIR="@@OUTPUT_BASE@@/Audio/Music"
+
+# ---------- FLAC settings ----------
+FLACOPTS="--best"
+
+# ---------- MP3 settings ----------
+LAMEOPTS="--cbr -b 320"
+
+# ---------- CD lookup / tagging ----------
+CDDBMETHOD=musicbrainz
+CDDBPROTO=6
+
+# ---------- File naming ----------
+# Output: Artist/Album/Track - Title.flac
+OUTPUTFORMAT='${ARTISTFILE}/${ALBUMFILE}/${TRACKNUM} - ${TITLEFILE}'
+VAOUTPUTFORMAT='Various Artists/${ALBUMFILE}/${TRACKNUM} - ${ARTISTFILE} - ${TITLEFILE}'
+ONETRACKOUTPUTFORMAT='${ARTISTFILE}/${ALBUMFILE}/${ALBUMFILE}'
+
+# ---------- Filename cleanup ----------
+mungefilename ()
+{
+  echo "$@" | sed -e 's/^\.*//' | tr -d ":><|*/\"'?\\!"
+}
+
+# ---------- Temp directory ----------
+# abcde uses WAVOUTPUTDIR for intermediate files during ripping/encoding.
+# Must be a writable location (default is $PWD, which may be / under systemd).
+WAVOUTPUTDIR="/tmp"
+
+# ---------- Ripper ----------
+CDROMREADERSYNTAX=cdparanoia
+CDPARANOIA=cdparanoia
+CDPARANOIAOPTS="--never-skip=40"
+
+# ---------- Tagging ----------
+EJECTCD=n            # We handle eject in the main script
+PADTRACKS=y          # Zero-pad track numbers (01, 02, ...)
+NOGAP=y              # Gapless ripping
+BATCHNORM=n
+EXTRAVERBOSE=2
+MAXPROCS=@@MAX_ENCODE_PROCS@@
+
+# ---------- Album art ----------
+GETALBUMART=y
+ALBUMARTFILE="cover.jpg"
+ALBUMARTTYPE="Front"

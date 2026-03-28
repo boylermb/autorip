@@ -1,0 +1,13 @@
+[Unit]
+Description=Poll autorip transcode queue for new jobs
+Documentation=https://github.com/boylermb/autorip
+
+[Timer]
+# NFS does not support inotify, so we poll.
+# Check every 30 seconds for new transcode jobs.
+OnBootSec=30
+OnUnitActiveSec=30
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target
