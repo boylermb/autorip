@@ -140,6 +140,19 @@ movie_fallback_file() {
     mkdir -p "$fallback_dir"
     mv -f "$mkv" "$fallback_dir/"
     log "Moved $(basename "$mkv") to $fallback_dir"
+
+    # Enqueue OCR-based identification as a Kubernetes Job.
+    # The episode-identify pipeline will attempt to read on-screen text
+    # (title cards, credits) and match against TMDb.  If successful it
+    # moves the file into the correct Jellyfin folder structure.
+    local moved_file="$fallback_dir/$(basename "$mkv")"
+    if [ -x /usr/local/bin/enqueue-identify.sh ] && [ -f "$moved_file" ]; then
+        log "Enqueueing OCR identification job for $(basename "$mkv")"
+        /usr/local/bin/enqueue-identify.sh "$moved_file" || \
+            log "WARNING: Failed to enqueue OCR identification job"
+    else
+        log "enqueue-identify.sh not available, skipping OCR identification"
+    fi
 }
 
 # ---------- Process a single job ----------

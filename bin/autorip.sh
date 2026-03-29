@@ -302,6 +302,18 @@ movie_fallback() {
     mkdir -p "$fallback_dir"
     find "$src_dir" -name "*.mkv" -exec mv -f {} "$fallback_dir/" \;
     log "Moved unidentified files to $fallback_dir"
+
+    # Enqueue OCR-based identification for each unidentified file
+    if [ -x /usr/local/bin/enqueue-identify.sh ]; then
+        for mkv in "$fallback_dir"/*.mkv; do
+            [ -f "$mkv" ] || continue
+            log "Enqueueing OCR identification job for $(basename "$mkv")"
+            /usr/local/bin/enqueue-identify.sh "$mkv" || \
+                log "WARNING: Failed to enqueue OCR identification job for $(basename "$mkv")"
+        done
+    else
+        log "enqueue-identify.sh not available, skipping OCR identification"
+    fi
 }
 
 # ---------- Enqueue transcode job for GPU worker ----------
