@@ -406,7 +406,7 @@ def review_approve():
     if not job_id:
         return jsonify({"error": "Missing job_id"}), 400
     # Sanitise: only allow expected filename characters
-    if not re.match(r"^[\w.\-]+$", job_id):
+    if not re.match(r"^[\w.\-,:()\[\] ]+$", job_id):
         return jsonify({"error": "Invalid job_id"}), 400
     result = subprocess.run(
         [WORKER_SCRIPT, "approve", job_id],
@@ -423,7 +423,7 @@ def review_reject():
     job_id = request.json.get("job_id", "") if request.is_json else ""
     if not job_id:
         return jsonify({"error": "Missing job_id"}), 400
-    if not re.match(r"^[\w.\-]+$", job_id):
+    if not re.match(r"^[\w.\-,:()\[\] ]+$", job_id):
         return jsonify({"error": "Invalid job_id"}), 400
     result = subprocess.run(
         [WORKER_SCRIPT, "reject", job_id],
