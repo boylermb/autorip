@@ -282,7 +282,7 @@ for t in tracks:
     # Process each audio file in the staging directory
     local file_num=0
     local ext="$format"
-    for audio_file in $(find "$staging_dir" -maxdepth 1 -name "*.$ext" 2>/dev/null | sort); do
+    while IFS= read -r audio_file; do
         [ -f "$audio_file" ] || continue
         file_num=$((file_num + 1))
 
@@ -334,7 +334,7 @@ for t in tracks:
 
         cp -f "$audio_file" "$final_dir/$new_name"
         log "  → $new_name"
-    done
+    done < <(find "$staging_dir" -maxdepth 1 -name "*.$ext" 2>/dev/null | sort)
 
     # Copy cover art to final directory
     if [ -f "$staging_dir/cover.jpg" ]; then
