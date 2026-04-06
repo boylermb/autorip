@@ -10,6 +10,8 @@ Provides:
     POST /rip             — Trigger a rip on the specified device
     POST /eject           — Eject the specified device
     GET  /transcode-queue — Shared GPU transcode queue state
+    POST /review/approve  — Approve a single reviewed job
+    POST /review/reject   — Reject a single reviewed job
     GET  /health          — Health check
 
 Configuration is read from /etc/autorip/autorip.conf (or $AUTORIP_CONF).
@@ -390,6 +392,46 @@ def rip_log_art():
     if os.path.isfile(full_path):
         return send_file(full_path, mimetype="image/jpeg")
     abort(404)
+
+
+WORKER_SCRIPT = os.path.join(
+    _config.get("PREFIX", "/usr/local"), "bin", "transcode-worker.sh"
+)
+
+
+@app.route("/review/approve", methods=["POST"])
+def review_approve():
+    """Approve a single reviewed job — logs to rip history + cleans staging."""
+    job_id = request.json.get("job_id", "") if request.is_json else ""
+    if not job_id:
+        return jsonify({"error": "Missing job_id"}), 400
+    # Sanitise: only allow expected filename characters
+    if not re.match(r"^[\w.\-]+$", job_id):
+        return jsonify({"error": "Invalid job_id"}), 400
+    result = subprocess.run(
+        [WORKER_SCRIPT, "approve", job_id],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode == 0:
+        return jsonify({"ok": True, "message": f"Approved {job_id}"})
+    return jsonify({"error": result.stderr.strip() or "approve failed"}), 500
+
+
+@app.route("/review/reject", methods=["POST"])
+def review_reject():
+    """Reject a single reviewed job — removes from library + cleans staging."""
+    job_id = request.json.get("job_id", "") if request.is_json else ""
+    if not job_id:
+        return jsonify({"error": "Missing job_id"}), 400
+    if not re.match(r"^[\w.\-]+$", job_id):
+        return jsonify({"error": "Invalid job_id"}), 400
+    result = subprocess.run(
+        [WORKER_SCRIPT, "reject", job_id],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode == 0:
+        return jsonify({"ok": True, "message": f"Rejected {job_id}"})
+    return jsonify({"error": result.stderr.strip() or "reject failed"}), 500
 
 
 @app.route("/health")

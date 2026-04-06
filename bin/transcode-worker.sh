@@ -566,12 +566,170 @@ list_reviewed() {
     fi
 }
 
+# ---------- approve: approve a single reviewed job ----------
+approve_single() {
+    local job_id="$1"
+    local review_file=""
+
+    # Find the .review file matching job_id (match by prefix or full name)
+    for f in "$QUEUE_DIR"/*.review; do
+        [ -f "$f" ] || continue
+        local base
+        base=$(basename "$f")
+        if [ "$base" = "$job_id" ] || [ "$base" = "${job_id}.review" ] || [ "${base%.review}" = "$job_id" ]; then
+            review_file="$f"
+            break
+        fi
+    done
+
+    if [ -z "$review_file" ]; then
+        echo "ERROR: No review job found matching: $job_id" >&2
+        exit 1
+    fi
+
+    log "Approving single job: $(basename "$review_file")"
+
+    # Extract job info and log to rip history
+    local job_type="" artist="" album="" staging_dir="" file_path=""
+    job_type=$(grep -oP '"job_type"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || echo "video")
+    artist=$(grep -oP '"artist"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
+    album=$(grep -oP '"album"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
+    staging_dir=$(grep -oP '"staging_dir"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
+
+    if [ -z "$staging_dir" ]; then
+        file_path=$(grep -oP '"file_path"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
+        staging_dir=$(dirname "$file_path" 2>/dev/null || echo "")
+    fi
+
+    # Log to rip history
+    if [ "$job_type" = "audio-cd" ] && [ -n "$artist" ] && [ -n "$album" ]; then
+        local tracks_json format
+        tracks_json=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    job = json.load(f)
+print(json.dumps(job.get('tracks', [])))
+" "$review_file" 2>/dev/null || echo "[]")
+        format=$(grep -oP '"format"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || echo "mp3")
+
+        local safe_artist safe_album cover_rel=""
+        safe_artist=$(echo "$artist" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
+        safe_album=$(echo "$album" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
+        if [ -f "$MUSIC_DIR/$safe_artist/$safe_album/cover.jpg" ]; then
+            cover_rel="Audio/Music/$safe_artist/$safe_album/cover.jpg"
+        fi
+        log_rip_entry "Audio CD" "$artist" "$album" "$tracks_json" "$cover_rel"
+    fi
+
+    # Clean staging directory
+    if [ -n "$staging_dir" ] && [ -d "$staging_dir" ]; then
+        local dir_size
+        dir_size=$(du -sh "$staging_dir" 2>/dev/null | cut -f1)
+        log "Cleaning staging: $staging_dir ($dir_size)"
+        rm -rf "$staging_dir"
+        local parent_dir
+        parent_dir=$(dirname "$staging_dir")
+        if [ -d "$parent_dir" ] && [ "$(basename "$parent_dir")" != ".autorip-staging" ]; then
+            rmdir "$parent_dir" 2>/dev/null || true
+        fi
+    fi
+
+    rm -f "$review_file"
+    log "Approved: $(basename "$review_file")"
+    echo "OK"
+}
+
+# ---------- reject: reject a single reviewed job (remove from library + staging) ----------
+reject_single() {
+    local job_id="$1"
+    local review_file=""
+
+    for f in "$QUEUE_DIR"/*.review; do
+        [ -f "$f" ] || continue
+        local base
+        base=$(basename "$f")
+        if [ "$base" = "$job_id" ] || [ "$base" = "${job_id}.review" ] || [ "${base%.review}" = "$job_id" ]; then
+            review_file="$f"
+            break
+        fi
+    done
+
+    if [ -z "$review_file" ]; then
+        echo "ERROR: No review job found matching: $job_id" >&2
+        exit 1
+    fi
+
+    log "Rejecting job: $(basename "$review_file")"
+
+    local job_type="" artist="" album="" staging_dir="" file_path="" format=""
+    job_type=$(grep -oP '"job_type"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || echo "video")
+    artist=$(grep -oP '"artist"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
+    album=$(grep -oP '"album"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
+    staging_dir=$(grep -oP '"staging_dir"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
+    format=$(grep -oP '"format"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || echo "mp3")
+
+    if [ -z "$staging_dir" ]; then
+        file_path=$(grep -oP '"file_path"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
+        staging_dir=$(dirname "$file_path" 2>/dev/null || echo "")
+    fi
+
+    # Remove from final library
+    if [ "$job_type" = "audio-cd" ] && [ -n "$artist" ] && [ -n "$album" ]; then
+        local safe_artist safe_album
+        safe_artist=$(echo "$artist" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
+        safe_album=$(echo "$album" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
+        local final_dir="$MUSIC_DIR/$safe_artist/$safe_album"
+        if [ -d "$final_dir" ]; then
+            log "Removing from library: $final_dir"
+            rm -rf "$final_dir"
+            # Clean up empty artist dir
+            local artist_dir="$MUSIC_DIR/$safe_artist"
+            if [ -d "$artist_dir" ]; then
+                rmdir "$artist_dir" 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    # Clean staging directory
+    if [ -n "$staging_dir" ] && [ -d "$staging_dir" ]; then
+        log "Cleaning staging: $staging_dir"
+        rm -rf "$staging_dir"
+        local parent_dir
+        parent_dir=$(dirname "$staging_dir")
+        if [ -d "$parent_dir" ] && [ "$(basename "$parent_dir")" != ".autorip-staging" ]; then
+            rmdir "$parent_dir" 2>/dev/null || true
+        fi
+    fi
+
+    rm -f "$review_file"
+    log "Rejected and cleaned: $(basename "$review_file")"
+    echo "OK"
+}
+
 # ---------- Handle subcommands ----------
 case "${1:-}" in
     clean)
         mkdir -p "$QUEUE_DIR"
         log "Cleaning reviewed jobs..."
         clean_reviewed
+        exit 0
+        ;;
+    approve)
+        mkdir -p "$QUEUE_DIR"
+        if [ -z "${2:-}" ]; then
+            echo "Usage: $0 approve <job_file>" >&2
+            exit 1
+        fi
+        approve_single "$2"
+        exit 0
+        ;;
+    reject)
+        mkdir -p "$QUEUE_DIR"
+        if [ -z "${2:-}" ]; then
+            echo "Usage: $0 reject <job_file>" >&2
+            exit 1
+        fi
+        reject_single "$2"
         exit 0
         ;;
     list|review|status)
@@ -584,10 +742,12 @@ case "${1:-}" in
         # No subcommand or flags — fall through to normal job processing
         ;;
     *)
-        echo "Usage: $0 [clean|list]" >&2
+        echo "Usage: $0 [clean|list|approve <job>|reject <job>]" >&2
         echo "  (no args)  Process pending queue jobs" >&2
         echo "  list       Show jobs pending review" >&2
-        echo "  clean      Purge reviewed staging dirs" >&2
+        echo "  clean      Approve all and purge staging" >&2
+        echo "  approve    Approve a single job" >&2
+        echo "  reject     Reject a single job (removes from library)" >&2
         exit 1
         ;;
 esac
