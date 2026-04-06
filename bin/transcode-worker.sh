@@ -342,12 +342,7 @@ for t in tracks:
         log "Copied cover art to $final_dir"
     fi
 
-    # Record in rip log
-    local cover_rel=""
-    if [ -f "$final_dir/cover.jpg" ]; then
-        cover_rel="Audio/Music/$safe_artist/$safe_album/cover.jpg"
-    fi
-    log_rip_entry "Audio CD" "$artist" "$album" "$tracks_json" "$cover_rel"
+    # Rip log entry is deferred until review is approved (clean subcommand).
 
     # Keep staging directory for review — files are copied, not moved.
     # Run `transcode-worker.sh clean` to purge reviewed staging dirs.
@@ -492,6 +487,31 @@ clean_reviewed() {
             fi
         else
             log "Cleaning: $job_desc (no staging dir to remove)"
+        fi
+
+        # Record in rip history now that review is approved
+        local job_type="" artist="" album="" format="" tracks_json=""
+        job_type=$(grep -oP '"job_type"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || echo "video")
+        artist=$(grep -oP '"artist"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
+        album=$(grep -oP '"album"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
+        format=$(grep -oP '"format"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || echo "mp3")
+
+        if [ "$job_type" = "audio-cd" ] && [ -n "$artist" ] && [ -n "$album" ]; then
+            # Extract tracks JSON array using python3
+            tracks_json=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    job = json.load(f)
+print(json.dumps(job.get('tracks', [])))
+" "$review_file" 2>/dev/null || echo "[]")
+
+            local safe_artist safe_album cover_rel=""
+            safe_artist=$(echo "$artist" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
+            safe_album=$(echo "$album" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
+            if [ -f "$MUSIC_DIR/$safe_artist/$safe_album/cover.jpg" ]; then
+                cover_rel="Audio/Music/$safe_artist/$safe_album/cover.jpg"
+            fi
+            log_rip_entry "Audio CD" "$artist" "$album" "$tracks_json" "$cover_rel"
         fi
 
         rm -f "$review_file"
