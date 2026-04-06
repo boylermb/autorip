@@ -13,9 +13,9 @@ OUTPUTTYPE="@@CD_FORMAT@@"
 OUTPUTDIR="@@OUTPUT_BASE@@/.autorip-staging"
 
 # ---------- Actions ----------
-# Only: look up metadata (cddb), rip (read), encode, and clean temp files.
-# Tagging and moving are handled by the post-process worker.
-ACTIONS=cddb,read,encode,clean
+# Look up metadata (cddb), rip (read), encode, move files to staging, and
+# clean temp files.  Tagging is handled by the post-process worker.
+ACTIONS=cddb,read,encode,move,clean
 
 # ---------- FLAC settings ----------
 FLACOPTS="--best"
