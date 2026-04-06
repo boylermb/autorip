@@ -647,7 +647,7 @@ if $is_audio_cd; then
         dup_result=0
         check_library_duplicate "$CD_ARTIST" "$CD_ALBUM" "$cd_track_count" || dup_result=$?
         if [ "$dup_result" -eq 0 ]; then
-            # Exact duplicate — skip rip entirely
+            # Exact duplicate — skip rip, eject disc
             update_status "complete" "Audio CD" "$CD_ALBUM" "Already in library — skipped" "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON"
             log "Ejecting disc (duplicate)..."
             sleep 2
