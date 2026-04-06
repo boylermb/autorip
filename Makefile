@@ -51,8 +51,8 @@ install-deps:
 		build-essential pkg-config libc6-dev libssl-dev libexpat1-dev \
 		libavcodec-dev libgl1-mesa-dev zlib1g-dev wget \
 		libdvdcss2 abcde flac lame cdparanoia id3v2 eject at ffmpeg \
-		glyrc cd-discid python3 python3-pip python3-venv
-	pip3 install --break-system-packages eyed3 mnamer
+		glyrc cd-discid libdiscid0 python3 python3-pip python3-venv
+	pip3 install --break-system-packages eyed3 mnamer discid musicbrainzngs
 
 # ==========================================================================
 # install-makemkv — Build from source

@@ -95,6 +95,8 @@ def read_transcode_queue():
             state = "processing"
         elif entry.endswith(".done"):
             state = "done"
+        elif entry.endswith(".review"):
+            state = "review"
         elif entry.endswith(".error"):
             state = "error"
         else:
@@ -115,6 +117,10 @@ def read_transcode_queue():
             else:
                 data["file_exists"] = False
                 data["file_transcoding"] = False
+            # Audio-cd jobs: check staging dir
+            sdir = data.get("staging_dir", "")
+            if sdir:
+                data["staging_exists"] = os.path.isdir(sdir)
             jobs.append(data)
         except (json.JSONDecodeError, OSError):
             jobs.append({"job_file": entry, "state": state, "error": "unreadable"})
@@ -343,6 +349,47 @@ def eject():
 def transcode_queue():
     """Return the current state of the GPU transcode queue."""
     return jsonify(read_transcode_queue())
+
+
+@app.route("/rip-log")
+def rip_log():
+    """Return the shared rip log (JSON array of all rips across all nodes).
+
+    Query params:
+      ?limit=N   — return only the most recent N entries (default: all)
+    """
+    rip_log_path = os.path.join(OUTPUT_BASE, ".rip-log.json")
+    try:
+        with open(rip_log_path, "r") as f:
+            entries = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        entries = []
+
+    limit = request.args.get("limit", type=int)
+    if limit and limit > 0:
+        entries = entries[-limit:]
+
+    return jsonify(entries)
+
+
+@app.route("/rip-log/art")
+def rip_log_art():
+    """Serve album cover art referenced in a rip-log entry.
+
+    Query params:
+      ?path=Audio/Music/Artist/Album/cover.jpg  — relative to OUTPUT_BASE
+    """
+    rel_path = request.args.get("path", "")
+    if not rel_path:
+        abort(400)
+    # Prevent directory traversal
+    safe = os.path.normpath(rel_path)
+    if safe.startswith("..") or safe.startswith("/"):
+        abort(400)
+    full_path = os.path.join(OUTPUT_BASE, safe)
+    if os.path.isfile(full_path):
+        return send_file(full_path, mimetype="image/jpeg")
+    abort(404)
 
 
 @app.route("/health")

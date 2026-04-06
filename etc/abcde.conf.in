@@ -1,9 +1,21 @@
 # /etc/abcde.conf - Audio CD ripping configuration
 # Installed by autorip — https://github.com/boylermb/autorip
+#
+# Strategy: abcde rips and encodes only. Post-processing (tagging, naming,
+# album art, final placement) is handled by the transcode-worker, which
+# picks up a job from the shared queue after the rip completes.
 
 # ---------- Output format ----------
 OUTPUTTYPE="@@CD_FORMAT@@"
-OUTPUTDIR="@@OUTPUT_BASE@@/Audio/Music"
+
+# Staging area — abcde writes here; the post-process worker moves files
+# to the final Music library after tagging and renaming.
+OUTPUTDIR="@@OUTPUT_BASE@@/.autorip-staging"
+
+# ---------- Actions ----------
+# Only: look up metadata (cddb), rip (read), encode, and clean temp files.
+# Tagging and moving are handled by the post-process worker.
+ACTIONS=cddb,read,encode,clean
 
 # ---------- FLAC settings ----------
 FLACOPTS="--best"
@@ -16,9 +28,10 @@ CDDBMETHOD=musicbrainz
 CDDBPROTO=6
 
 # ---------- File naming ----------
-# Output: Artist/Album/Track - Title.flac
-OUTPUTFORMAT='${ARTISTFILE}/${ALBUMFILE}/${TRACKNUM} - ${TITLEFILE}'
-VAOUTPUTFORMAT='Various Artists/${ALBUMFILE}/${TRACKNUM} - ${ARTISTFILE} - ${TITLEFILE}'
+# Staging layout: Artist/Album/NN.ext (simple numbered files).
+# The post-process worker renames to "NN - Title.ext" when tagging.
+OUTPUTFORMAT='${ARTISTFILE}/${ALBUMFILE}/${TRACKNUM}'
+VAOUTPUTFORMAT='Various Artists/${ALBUMFILE}/${TRACKNUM}'
 ONETRACKOUTPUTFORMAT='${ARTISTFILE}/${ALBUMFILE}/${ALBUMFILE}'
 
 # ---------- Filename cleanup ----------

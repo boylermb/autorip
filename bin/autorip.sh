@@ -102,71 +102,120 @@ EOF
     mv -f "$tmpfile" "$STATUS_DIR/status.json"
 }
 
-# Fetch CD metadata from MusicBrainz via cd-discid and query
+# Fetch CD metadata from MusicBrainz via python-discid + musicbrainzngs
 fetch_cd_metadata() {
     local device="$1"
     CD_ARTIST=""
     CD_ALBUM=""
     CD_TRACKS_JSON="[]"
 
-    local discid
-    discid=$(cd-discid "$device" 2>/dev/null || true)
-    if [ -z "$discid" ]; then
-        log "Could not read disc ID"
+    if ! command -v python3 >/dev/null 2>&1; then
+        log "python3 not available, skipping metadata lookup"
         return
     fi
 
-    local tmpdir
-    tmpdir=$(mktemp -d /tmp/abcde-meta.XXXXXX)
-
-    local cddb_data
-    cddb_data=$(cddbcmd query $discid 2>/dev/null || true)
-
-    local track_count
-    track_count=$(echo "$discid" | awk '{print $2}')
-
-    if command -v python3 >/dev/null 2>&1; then
-        eval "$(python3 -c "
-import subprocess, json, re, sys
+    eval "$(python3 -c "
+import json, sys
 try:
-    result = subprocess.run(['cd-discid', '$device'], capture_output=True, text=True, timeout=10)
-    parts = result.stdout.strip().split()
-    disc_id = parts[0] if parts else ''
-    track_count = int(parts[1]) if len(parts) > 1 else 0
+    import discid
+    disc = discid.read('$device')
 
-    import urllib.request, urllib.error
-    url = f'https://musicbrainz.org/ws/2/discid/{disc_id}?fmt=json'
-    req = urllib.request.Request(url, headers={'User-Agent': 'autorip/1.0'})
-    resp = urllib.request.urlopen(req, timeout=10)
-    data = json.loads(resp.read())
+    import musicbrainzngs
+    musicbrainzngs.set_useragent('autorip', '1.0', 'https://github.com/boylermb/autorip')
+    result = musicbrainzngs.get_releases_by_discid(disc.id, includes=['artists', 'recordings'])
+    releases = result.get('disc', {}).get('release-list', [])
 
-    releases = data.get('releases', [])
     if releases:
         release = releases[0]
-        artist = release.get('artist-credit', [{}])[0].get('name', 'Unknown Artist')
+        artist = release.get('artist-credit-phrase', 'Unknown Artist')
         album = release.get('title', 'Unknown Album')
         tracks = []
-        for medium in release.get('media', []):
-            for track in medium.get('tracks', []):
-                tracks.append(track.get('title', f'Track {track.get(\"number\", \"?\")}'))
-        print(f'CD_ARTIST=\"{artist}\"')
-        print(f'CD_ALBUM=\"{album}\"')
-        tracks_escaped = json.dumps(tracks)
-        print(f'CD_TRACKS_JSON={chr(39)}{tracks_escaped}{chr(39)}')
+        for medium in release.get('medium-list', []):
+            for track in medium.get('track-list', []):
+                rec = track.get('recording', {})
+                tracks.append(rec.get('title', 'Track ' + track.get('number', '?')))
+        # Shell-safe output via json.dumps
+        a_esc = artist.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))
+        b_esc = album.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))
+        print(\"CD_ARTIST='\" + a_esc + \"'\")
+        print(\"CD_ALBUM='\" + b_esc + \"'\")
+        print(\"CD_TRACKS_JSON='\" + json.dumps(tracks) + \"'\")
     else:
         print('CD_ARTIST=\"Unknown Artist\"')
         print('CD_ALBUM=\"Unknown Album\"')
         print('CD_TRACKS_JSON=\"[]\"')
 except Exception as e:
-    print(f'# metadata lookup failed: {e}', file=sys.stderr)
+    print('# metadata lookup failed: ' + str(e), file=sys.stderr)
     print('CD_ARTIST=\"Unknown Artist\"')
     print('CD_ALBUM=\"Unknown Album\"')
     print('CD_TRACKS_JSON=\"[]\"')
 " 2>/dev/null)"
-    fi
 
-    rm -rf "$tmpdir"
     log "Metadata: Artist=$CD_ARTIST, Album=$CD_ALBUM"
+}
+
+# ---------- Rip log ----------
+# Append an entry to the shared rip log on the NAS after every successful rip.
+# The log lives at $OUTPUT_BASE/.rip-log.json — a JSON array of objects.
+# Both audio and video rips are recorded.
+RIP_LOG="$OUTPUT_BASE/.rip-log.json"
+
+log_rip_entry() {
+    local disc_type="$1"
+    local artist="$2"
+    local album="$3"
+    local tracks_json="$4"       # JSON array of track names, e.g. ["Run-Around","Hook"]
+    local cover_art_path="$5"    # Relative path from $OUTPUT_BASE, or empty
+
+    local s_artist s_album s_cover
+    s_artist=$(json_escape "$artist")
+    s_album=$(json_escape "$album")
+    s_cover=$(json_escape "$cover_art_path")
+
+    local entry
+    entry=$(cat <<ENTRY
+{
+    "timestamp": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+    "hostname": "${HOSTNAME}",
+    "device": "$(basename "$DEVICE")",
+    "disc_type": "${disc_type}",
+    "artist": "${s_artist}",
+    "album": "${s_album}",
+    "tracks": ${tracks_json},
+    "cover_art": "${s_cover}"
+}
+ENTRY
+)
+
+    # Atomic append: read existing log, append entry, write back with a tmpfile
+    # Uses flock to prevent concurrent writes from multiple nodes
+    (
+        flock -w 5 201 || { log "WARNING: Could not acquire rip-log lock"; return; }
+
+        existing="[]"
+        if [ -f "$RIP_LOG" ]; then
+            existing=$(cat "$RIP_LOG" 2>/dev/null || echo "[]")
+            # Validate it looks like a JSON array
+            if ! echo "$existing" | head -c1 | grep -q '\['; then
+                existing="[]"
+            fi
+        fi
+
+        # Use python3 to safely append to the JSON array
+        python3 -c "
+import json, sys
+try:
+    log = json.loads(sys.argv[1])
+except Exception:
+    log = []
+entry = json.loads(sys.argv[2])
+log.append(entry)
+print(json.dumps(log, indent=2))
+" "$existing" "$entry" > "${RIP_LOG}.tmp" && mv -f "${RIP_LOG}.tmp" "$RIP_LOG"
+
+    ) 201>"${RIP_LOG}.lock"
+
+    log "Rip logged: $disc_type — $artist / $album ($(echo "$tracks_json" | python3 -c 'import json,sys; print(len(json.loads(sys.stdin.read())))' 2>/dev/null || echo '?') tracks)"
 }
 
 # Fetch album art and save to status directory
@@ -332,6 +381,46 @@ ENDJOB
     log "Queued: $(basename "$job_file")"
 }
 
+# ---------- Enqueue audio CD post-processing job ----------
+enqueue_audio_job() {
+    local artist="$1"
+    local album="$2"
+    local tracks_json="$3"       # JSON array of track names
+    local staging_dir="$4"       # abcde staging output dir
+
+    mkdir -p "$QUEUE_DIR"
+    local safe_album
+    safe_album=$(echo "$album" | tr ' /:' '_' | tr -d '"')
+    local job_file="$QUEUE_DIR/${HOSTNAME}_audiocd_${safe_album}_$(date +%s).json"
+    local tmpfile
+    tmpfile=$(mktemp "$QUEUE_DIR/.job.XXXXXX")
+    chmod 644 "$tmpfile"
+
+    # Copy cover art into staging dir if we fetched one
+    if [ -f "$STATUS_DIR/cover.jpg" ] && [ -d "$staging_dir" ]; then
+        cp -f "$STATUS_DIR/cover.jpg" "$staging_dir/cover.jpg"
+    fi
+
+    local s_artist s_album
+    s_artist=$(json_escape "$artist")
+    s_album=$(json_escape "$album")
+
+    cat > "$tmpfile" <<ENDJOB
+{
+    "job_type": "audio-cd",
+    "artist": "${s_artist}",
+    "album": "${s_album}",
+    "tracks": ${tracks_json},
+    "staging_dir": "${staging_dir}",
+    "format": "${CD_FORMAT:-mp3}",
+    "source_host": "$HOSTNAME",
+    "submitted": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+ENDJOB
+    mv -f "$tmpfile" "$job_file"
+    log "Queued audio CD job: $(basename "$job_file")"
+}
+
 # ---------- Lock to prevent concurrent rips on same drive ----------
 mkdir -p "$LOCK_DIR"
 LOCKFILE="$LOCK_DIR/$(basename "$DEVICE").lock"
@@ -473,6 +562,15 @@ rip_video_disc() {
     done
 
     update_status "complete" "$disc_type" "$DISC_TITLE" "$TITLE_COUNT title(s) queued for transcode" "" "$DISC_TITLE" "[]"
+
+    # Record this rip in the shared log
+    local video_tracks_json
+    video_tracks_json=$(printf '%s\n' "${TITLE_IDS[@]}" | python3 -c "
+import sys, json
+titles = [f'Title {line.strip()}' for line in sys.stdin if line.strip()]
+print(json.dumps(titles))
+" 2>/dev/null || echo '[]')
+    log_rip_entry "$disc_type" "" "$DISC_TITLE" "$video_tracks_json" ""
 }
 
 # ---------- Rip Blu-ray ----------
@@ -494,9 +592,30 @@ if $is_audio_cd; then
     fetch_album_art "$CD_ARTIST" "$CD_ALBUM"
     update_status "ripping" "Audio CD" "$CD_ALBUM" "Ripping..." "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON"
 
+    # abcde rips and encodes to staging: .autorip-staging/Artist/Album/NN.mp3
+    # Tagging, renaming, and final move are handled by the post-process worker.
     if abcde -d "$DEVICE" -N -c /etc/abcde.conf 2>&1; then
         log "Audio CD rip complete"
-        update_status "complete" "Audio CD" "$CD_ALBUM" "Done" "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON"
+
+        # Locate the staging directory abcde created
+        artist_dir=$(echo "$CD_ARTIST" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
+        album_dir=$(echo "$CD_ALBUM" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
+        staging_album="$STAGING_DIR/$artist_dir/$album_dir"
+
+        if [ ! -d "$staging_album" ]; then
+            # Fallback: find the most recently created directory in staging
+            staging_album=$(find "$STAGING_DIR" -mindepth 2 -maxdepth 2 -type d -newer "$LOCKFILE" 2>/dev/null | head -1)
+        fi
+
+        if [ -d "$staging_album" ]; then
+            # Enqueue post-processing job
+            enqueue_audio_job "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON" "$staging_album"
+            update_status "complete" "Audio CD" "$CD_ALBUM" "Queued for post-processing" "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON"
+        else
+            log "ERROR: Could not find staging directory for $CD_ARTIST / $CD_ALBUM"
+            update_status "error" "Audio CD" "$CD_ALBUM" "Staging dir not found" "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON"
+            exit 1
+        fi
     else
         log "ERROR: abcde failed for Audio CD rip"
         update_status "error" "Audio CD" "$CD_ALBUM" "abcde failed" "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON"
