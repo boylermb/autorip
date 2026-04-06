@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+ #!/usr/bin/env bash
 # =============================================================================
 # autorip.sh - Automatically rip inserted optical media
 # https://github.com/boylermb/autorip
@@ -100,6 +100,51 @@ update_status() {
 }
 EOF
     mv -f "$tmpfile" "$STATUS_DIR/status.json"
+}
+
+# ---------- Library duplicate check ----------
+# Check whether the album already exists in the music library.
+# Returns:
+#   0 — exact duplicate (same track count) → caller should skip
+#   1 — no match, safe to rip
+#   2 — partial/different match → existing dir renamed to (old), safe to rip
+check_library_duplicate() {
+    local artist="$1"
+    local album="$2"
+    local disc_track_count="$3"
+    local format="${CD_FORMAT:-mp3}"
+
+    # Build the same sanitised path the worker will use
+    local safe_artist safe_album
+    safe_artist=$(echo "$artist" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
+    safe_album=$(echo "$album" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
+    local music_dir="$OUTPUT_BASE/Audio/Music"
+    local library_dir="$music_dir/$safe_artist/$safe_album"
+
+    # No existing directory — nothing to worry about
+    if [ ! -d "$library_dir" ]; then
+        return 1
+    fi
+
+    # Count audio files in the existing library directory
+    local existing_count
+    existing_count=$(find "$library_dir" -maxdepth 1 -type f -name "*.${format}" 2>/dev/null | wc -l)
+
+    if [ "$existing_count" -eq "$disc_track_count" ] && [ "$disc_track_count" -gt 0 ]; then
+        # Exact match — same number of tracks
+        log "Library already contains $artist / $album ($existing_count tracks) — skipping rip"
+        return 0
+    fi
+
+    # Partial or different — rename existing to (old)
+    local old_dir="$music_dir/$safe_artist/${safe_album} (old)"
+    # If (old) already exists, remove it to avoid stacking
+    if [ -d "$old_dir" ]; then
+        rm -rf "$old_dir"
+    fi
+    mv "$library_dir" "$old_dir"
+    log "Renamed existing $artist / $album ($existing_count tracks) to '${safe_album} (old)' — re-ripping"
+    return 2
 }
 
 # Fetch CD metadata from MusicBrainz via python-discid + musicbrainzngs
@@ -590,6 +635,30 @@ if $is_audio_cd; then
 
     fetch_cd_metadata "$DEVICE"
     fetch_album_art "$CD_ARTIST" "$CD_ALBUM"
+
+    # Count tracks from metadata for duplicate check
+    cd_track_count=0
+    if [ "$CD_TRACKS_JSON" != "[]" ]; then
+        cd_track_count=$(python3 -c "import json, sys; print(len(json.loads(sys.stdin.read())))" <<< "$CD_TRACKS_JSON" 2>/dev/null || echo 0)
+    fi
+
+    # Check if this album already exists in the library
+    if [ "$CD_ARTIST" != "Unknown Artist" ] && [ "$CD_ALBUM" != "Unknown Album" ]; then
+        dup_result=0
+        check_library_duplicate "$CD_ARTIST" "$CD_ALBUM" "$cd_track_count" || dup_result=$?
+        if [ "$dup_result" -eq 0 ]; then
+            # Exact duplicate — skip rip entirely
+            update_status "complete" "Audio CD" "$CD_ALBUM" "Already in library — skipped" "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON"
+            log "Ejecting disc (duplicate)..."
+            sleep 2
+            eject "$DEVICE" 2>/dev/null || true
+            update_status "idle"
+            log "Done (skipped duplicate)."
+            exit 0
+        fi
+        # dup_result 1 = no match, 2 = renamed old → continue ripping either way
+    fi
+
     update_status "ripping" "Audio CD" "$CD_ALBUM" "Ripping..." "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON"
 
     # abcde rips and encodes to staging: .autorip-staging/Artist/Album/NN.mp3
