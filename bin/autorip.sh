@@ -1,4 +1,4 @@
- #!/usr/bin/env bash
+#!/usr/bin/env bash
 # =============================================================================
 # autorip.sh - Automatically rip inserted optical media
 # https://github.com/boylermb/autorip
@@ -69,18 +69,22 @@ update_status() {
     local artist="${5:-}"
     local album="${6:-}"
     local tracks_json="${7:-[]}"
+    local tracks_total="${8:-0}"
+    local tracks_completed="${9:-0}"
+    local current_track="${10:-}"
     local has_art="false"
     if [ -f "$STATUS_DIR/cover.jpg" ]; then
         has_art="true"
     fi
     mkdir -p "$STATUS_DIR"
     # Escape user-supplied strings for safe JSON embedding
-    local s_title s_artist s_album s_disc_type s_progress
+    local s_title s_artist s_album s_disc_type s_progress s_current_track
     s_title=$(json_escape "$title")
     s_artist=$(json_escape "$artist")
     s_album=$(json_escape "$album")
     s_disc_type=$(json_escape "$disc_type")
     s_progress=$(json_escape "$progress")
+    s_current_track=$(json_escape "$current_track")
     local tmpfile
     tmpfile=$(mktemp "$STATUS_DIR/.status.json.XXXXXX")
     chmod 644 "$tmpfile"
@@ -95,6 +99,9 @@ update_status() {
     "artist": "${s_artist}",
     "album": "${s_album}",
     "tracks": ${tracks_json},
+    "tracks_total": ${tracks_total},
+    "tracks_completed": ${tracks_completed},
+    "current_track": "${s_current_track}",
     "has_art": ${has_art},
     "updated": "$(date '+%Y-%m-%d %H:%M:%S')"
 }
@@ -659,11 +666,48 @@ if $is_audio_cd; then
         # dup_result 1 = no match, 2 = renamed old → continue ripping either way
     fi
 
-    update_status "ripping" "Audio CD" "$CD_ALBUM" "Ripping..." "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON"
+    update_status "ripping" "Audio CD" "$CD_ALBUM" "Ripping track 1/$cd_track_count..." "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON" "$cd_track_count" "0" ""
 
     # abcde rips and encodes to staging: .autorip-staging/Artist/Album/NN.mp3
     # Tagging, renaming, and final move are handled by the post-process worker.
-    if abcde -d "$DEVICE" -N -c /etc/abcde.conf 2>&1; then
+    # Run abcde in the background and monitor its output for per-track progress.
+    # Use a FIFO to tee output to both the log (stderr, captured by systemd)
+    # and a temp file we can grep for progress parsing.
+    ABCDE_LOG=$(mktemp /tmp/autorip-abcde.XXXXXX)
+    abcde -d "$DEVICE" -N -c /etc/abcde.conf > >(tee "$ABCDE_LOG" >&2) 2>&1 &
+    ABCDE_PID=$!
+
+    # Monitor abcde output for track progress
+    tracks_seen=0
+    current_track_name=""
+    while kill -0 "$ABCDE_PID" 2>/dev/null; do
+        # Parse the latest "Grabbing track N:" line from abcde output
+        latest_grab=$(grep -oP 'Grabbing track \d+: \K.*(?=\.\.\.)' "$ABCDE_LOG" 2>/dev/null | tail -1)
+        new_count=$(grep -c 'Grabbing track' "$ABCDE_LOG" 2>/dev/null || echo 0)
+        # Tracks completed = tracks started minus the one currently in progress
+        completed=$((new_count > 0 ? new_count - 1 : 0))
+
+        if [ "$new_count" -ne "$tracks_seen" ] || [ "$latest_grab" != "$current_track_name" ]; then
+            tracks_seen=$new_count
+            current_track_name="$latest_grab"
+            update_status "ripping" "Audio CD" "$CD_ALBUM" \
+                "Ripping track $new_count/$cd_track_count..." \
+                "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON" \
+                "$cd_track_count" "$completed" "$current_track_name"
+        fi
+        sleep 3
+    done
+
+    # abcde finished — get its exit code
+    wait "$ABCDE_PID"
+    abcde_rc=$?
+    rm -f "$ABCDE_LOG"
+
+    if [ "$abcde_rc" -eq 0 ]; then
+        update_status "ripping" "Audio CD" "$CD_ALBUM" \
+            "Ripping complete ($cd_track_count/$cd_track_count)" \
+            "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON" \
+            "$cd_track_count" "$cd_track_count" ""
         log "Audio CD rip complete"
 
         # Locate the staging directory abcde created

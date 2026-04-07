@@ -153,6 +153,9 @@ def read_status():
             "artist": "",
             "album": "",
             "tracks": [],
+            "tracks_total": 0,
+            "tracks_completed": 0,
+            "current_track": "",
             "has_art": False,
             "updated": "",
         }
