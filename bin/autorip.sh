@@ -166,8 +166,11 @@ fetch_cd_metadata() {
         return
     fi
 
-    eval "$(python3 - "$device" <<'PYEOF' 2>/dev/null
-import json, sys
+    local _meta_tmp
+    _meta_tmp=$(mktemp /tmp/autorip-meta.XXXXXX)
+    python3 - "$device" "$_meta_tmp" <<'PYEOF' 2>/dev/null || true
+import json, sys, os
+outfile = sys.argv[2]
 try:
     import discid
     disc = discid.read(sys.argv[1])
@@ -186,23 +189,23 @@ try:
             for track in medium.get('track-list', []):
                 rec = track.get('recording', {})
                 tracks.append(rec.get('title', 'Track ' + track.get('number', '?')))
-        # Shell-safe output via json.dumps
-        a_esc = artist.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))
-        b_esc = album.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))
-        print("CD_ARTIST='" + a_esc + "'")
-        print("CD_ALBUM='" + b_esc + "'")
-        print("CD_TRACKS_JSON='" + json.dumps(tracks) + "'")
+        meta = {"artist": artist, "album": album, "tracks": tracks}
     else:
-        print('CD_ARTIST="Unknown Artist"')
-        print('CD_ALBUM="Unknown Album"')
-        print('CD_TRACKS_JSON="[]"')
+        meta = {"artist": "Unknown Artist", "album": "Unknown Album", "tracks": []}
 except Exception as e:
     print('# metadata lookup failed: ' + str(e), file=sys.stderr)
-    print('CD_ARTIST="Unknown Artist"')
-    print('CD_ALBUM="Unknown Album"')
-    print('CD_TRACKS_JSON="[]"')
+    meta = {"artist": "Unknown Artist", "album": "Unknown Album", "tracks": []}
+
+with open(outfile, 'w') as f:
+    json.dump(meta, f)
 PYEOF
-)"
+
+    if [ -f "$_meta_tmp" ] && [ -s "$_meta_tmp" ]; then
+        CD_ARTIST=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['artist'])" "$_meta_tmp" 2>/dev/null || echo "Unknown Artist")
+        CD_ALBUM=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['album'])" "$_meta_tmp" 2>/dev/null || echo "Unknown Album")
+        CD_TRACKS_JSON=$(python3 -c "import json,sys; print(json.dumps(json.load(open(sys.argv[1]))['tracks']))" "$_meta_tmp" 2>/dev/null || echo "[]")
+    fi
+    rm -f "$_meta_tmp"
 
     log "Metadata: Artist=$CD_ARTIST, Album=$CD_ALBUM"
 }
