@@ -166,11 +166,11 @@ fetch_cd_metadata() {
         return
     fi
 
-    eval "$(python3 -c "
+    eval "$(python3 - "$device" <<'PYEOF' 2>/dev/null
 import json, sys
 try:
     import discid
-    disc = discid.read('$device')
+    disc = discid.read(sys.argv[1])
 
     import musicbrainzngs
     musicbrainzngs.set_useragent('autorip', '1.0', 'https://github.com/boylermb/autorip')
@@ -189,19 +189,20 @@ try:
         # Shell-safe output via json.dumps
         a_esc = artist.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))
         b_esc = album.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))
-        print(\"CD_ARTIST='\" + a_esc + \"'\")
-        print(\"CD_ALBUM='\" + b_esc + \"'\")
-        print(\"CD_TRACKS_JSON='\" + json.dumps(tracks) + \"'\")
+        print("CD_ARTIST='" + a_esc + "'")
+        print("CD_ALBUM='" + b_esc + "'")
+        print("CD_TRACKS_JSON='" + json.dumps(tracks) + "'")
     else:
-        print('CD_ARTIST=\"Unknown Artist\"')
-        print('CD_ALBUM=\"Unknown Album\"')
-        print('CD_TRACKS_JSON=\"[]\"')
+        print('CD_ARTIST="Unknown Artist"')
+        print('CD_ALBUM="Unknown Album"')
+        print('CD_TRACKS_JSON="[]"')
 except Exception as e:
     print('# metadata lookup failed: ' + str(e), file=sys.stderr)
-    print('CD_ARTIST=\"Unknown Artist\"')
-    print('CD_ALBUM=\"Unknown Album\"')
-    print('CD_TRACKS_JSON=\"[]\"')
-" 2>/dev/null)"
+    print('CD_ARTIST="Unknown Artist"')
+    print('CD_ALBUM="Unknown Album"')
+    print('CD_TRACKS_JSON="[]"')
+PYEOF
+)"
 
     log "Metadata: Artist=$CD_ARTIST, Album=$CD_ALBUM"
 }
