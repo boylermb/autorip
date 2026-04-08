@@ -477,6 +477,12 @@ def review_edit():
     except (json.JSONDecodeError, OSError) as exc:
         return jsonify({"error": f"Failed to read job: {exc}"}), 500
 
+    # Snapshot original values on first edit so approve can find the old library path
+    for key in fields:
+        orig_key = f"_original_{key}"
+        if orig_key not in data and key in data:
+            data[orig_key] = data[key]
+
     # Apply edits
     for key, value in fields.items():
         data[key] = value

@@ -628,20 +628,25 @@ print(json.dumps(job.get('tracks', [])))
         safe_album=$(echo "$album" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
 
         # Remove old library output (in case metadata was edited and dest changed)
-        # Find previous dest from the original metadata on disk — just clean any
-        # matching dir and rebuild from staging.
         local final_dir="$MUSIC_DIR/$safe_artist/$safe_album"
 
-        # Also try to clean up any old dest that might differ (e.g. if artist/album was edited).
-        # We search for dirs containing files from the same staging batch by looking at the
-        # original job metadata before edits, but since we only have the current (edited)
-        # metadata, the simplest approach is: remove ALL matching library dirs that were
-        # created during the initial process_audio_cd_job.  The initial processing always
-        # writes to the same Artist/Album path computed from the JSON, so if the JSON was
-        # edited after processing, the old dir still exists under the old name.
-        # To handle this, we store the original dest in the review file.
+        # Determine the old library directory to clean up.
+        # Primary: _original_dest recorded during process_audio_cd_job.
+        # Fallback: compute from _original_artist/_original_album saved on first edit.
         local original_dir=""
         original_dir=$(grep -oP '"_original_dest"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
+        if [ -z "$original_dir" ]; then
+            # Fallback: compute from original (pre-edit) artist/album if available
+            local orig_artist orig_album
+            orig_artist=$(grep -oP '"_original_artist"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
+            orig_album=$(grep -oP '"_original_album"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
+            if [ -n "$orig_artist" ] && [ -n "$orig_album" ]; then
+                local safe_orig_artist safe_orig_album
+                safe_orig_artist=$(echo "$orig_artist" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
+                safe_orig_album=$(echo "$orig_album" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
+                original_dir="$MUSIC_DIR/$safe_orig_artist/$safe_orig_album"
+            fi
+        fi
         if [ -n "$original_dir" ] && [ -d "$original_dir" ] && [ "$original_dir" != "$final_dir" ]; then
             log "Removing old library dir (metadata was edited): $original_dir"
             rm -rf "$original_dir"
