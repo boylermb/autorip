@@ -686,7 +686,7 @@ if $is_audio_cd; then
     current_track_name=""
     while kill -0 "$ABCDE_PID" 2>/dev/null; do
         # Parse the latest "Grabbing track N:" line from abcde output
-        latest_grab=$(grep -oP 'Grabbing track \d+: \K.*(?=\.\.\.)' "$ABCDE_LOG" 2>/dev/null | tail -1)
+        latest_grab=$(grep -oP 'Grabbing track \d+: \K.*(?=\.\.\.)' "$ABCDE_LOG" 2>/dev/null | tail -1 || true)
         new_count=$(grep -c 'Grabbing track' "$ABCDE_LOG" 2>/dev/null || echo 0)
         # Tracks completed = tracks started minus the one currently in progress
         completed=$((new_count > 0 ? new_count - 1 : 0))
