@@ -160,6 +160,8 @@ fetch_cd_metadata() {
     CD_ARTIST=""
     CD_ALBUM=""
     CD_TRACKS_JSON="[]"
+    CD_DISC_ID=""
+    CD_SUBMISSION_URL=""
 
     if ! command -v python3 >/dev/null 2>&1; then
         log "python3 not available, skipping metadata lookup"
@@ -171,59 +173,79 @@ fetch_cd_metadata() {
     python3 - "$device" "$_meta_tmp" <<'PYEOF' 2>/dev/null || true
 import json, sys, os
 outfile = sys.argv[2]
+
+disc_id = ""
+submission_url = ""
+track_count = 0
+
 try:
     import discid
     disc = discid.read(sys.argv[1])
     disc_id = disc.id
-
-    import musicbrainzngs
-    musicbrainzngs.set_useragent('autorip', '1.0', 'https://github.com/boylermb/autorip')
-    result = musicbrainzngs.get_releases_by_discid(disc_id, includes=['artists', 'recordings'])
-    releases = result.get('disc', {}).get('release-list', [])
-
-    if releases:
-        release = releases[0]
-        artist = release.get('artist-credit-phrase', 'Unknown Artist')
-        album = release.get('title', 'Unknown Album')
-        medium_list = release.get('medium-list', [])
-        disc_total = len(medium_list)
-
-        # Find the medium that matches our disc ID
-        matched_medium = None
-        disc_number = 1
-        for medium in medium_list:
-            for md in medium.get('disc-list', []):
-                if md.get('id') == disc_id:
-                    matched_medium = medium
-                    disc_number = int(medium.get('position', 1))
-                    break
-            if matched_medium:
-                break
-
-        # Fallback: use the first medium if no disc-list match
-        if not matched_medium and medium_list:
-            matched_medium = medium_list[0]
-            disc_number = int(matched_medium.get('position', 1))
-
-        tracks = []
-        if matched_medium:
-            for track in matched_medium.get('track-list', []):
-                rec = track.get('recording', {})
-                tracks.append(rec.get('title', 'Track ' + track.get('number', '?')))
-
-        # Append disc number to album when multi-disc release
-        if disc_total > 1:
-            album = album + ' (Disc ' + str(disc_number) + ')'
-
-        meta = {"artist": artist, "album": album, "tracks": tracks,
-                "disc_number": disc_number, "disc_total": disc_total}
-    else:
-        meta = {"artist": "Unknown Artist", "album": "Unknown Album", "tracks": [],
-                "disc_number": 1, "disc_total": 1}
+    submission_url = disc.submission_url
+    track_count = len(disc.tracks)
 except Exception as e:
-    print('# metadata lookup failed: ' + str(e), file=sys.stderr)
-    meta = {"artist": "Unknown Artist", "album": "Unknown Album", "tracks": [],
-            "disc_number": 1, "disc_total": 1}
+    print('# discid read failed: ' + str(e), file=sys.stderr)
+
+found = False
+if disc_id:
+    try:
+        import musicbrainzngs
+        musicbrainzngs.set_useragent('autorip', '1.0', 'https://github.com/boylermb/autorip')
+        result = musicbrainzngs.get_releases_by_discid(disc_id, includes=['artists', 'recordings'])
+        releases = result.get('disc', {}).get('release-list', [])
+
+        if releases:
+            found = True
+            release = releases[0]
+            artist = release.get('artist-credit-phrase', 'Unknown Artist')
+            album = release.get('title', 'Unknown Album')
+            medium_list = release.get('medium-list', [])
+            disc_total = len(medium_list)
+
+            # Find the medium that matches our disc ID
+            matched_medium = None
+            disc_number = 1
+            for medium in medium_list:
+                for md in medium.get('disc-list', []):
+                    if md.get('id') == disc_id:
+                        matched_medium = medium
+                        disc_number = int(medium.get('position', 1))
+                        break
+                if matched_medium:
+                    break
+
+            # Fallback: use the first medium if no disc-list match
+            if not matched_medium and medium_list:
+                matched_medium = medium_list[0]
+                disc_number = int(matched_medium.get('position', 1))
+
+            tracks = []
+            if matched_medium:
+                for track in matched_medium.get('track-list', []):
+                    rec = track.get('recording', {})
+                    tracks.append(rec.get('title', 'Track ' + track.get('number', '?')))
+
+            # Append disc number to album when multi-disc release
+            if disc_total > 1:
+                album = album + ' (Disc ' + str(disc_number) + ')'
+
+            meta = {"artist": artist, "album": album, "tracks": tracks,
+                    "disc_number": disc_number, "disc_total": disc_total,
+                    "disc_id": disc_id, "submission_url": submission_url}
+    except Exception as e:
+        print('# musicbrainz lookup failed: ' + str(e), file=sys.stderr)
+
+if not found:
+    # MusicBrainz didn't match — use disc_id to make a unique album name
+    # so multiple unknown discs don't clobber each other in staging.
+    short_id = disc_id[:8] if disc_id else hex(int.from_bytes(os.urandom(4)))[2:]
+    album = f"Unknown Album ({short_id})"
+    # Generate placeholder track names from the disc's track count
+    tracks = [f"Track {i+1}" for i in range(track_count)]
+    meta = {"artist": "Unknown Artist", "album": album, "tracks": tracks,
+            "disc_number": 1, "disc_total": 1,
+            "disc_id": disc_id, "submission_url": submission_url}
 
 with open(outfile, 'w') as f:
     json.dump(meta, f)
@@ -233,10 +255,16 @@ PYEOF
         CD_ARTIST=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['artist'])" "$_meta_tmp" 2>/dev/null || echo "Unknown Artist")
         CD_ALBUM=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['album'])" "$_meta_tmp" 2>/dev/null || echo "Unknown Album")
         CD_TRACKS_JSON=$(python3 -c "import json,sys; print(json.dumps(json.load(open(sys.argv[1]))['tracks']))" "$_meta_tmp" 2>/dev/null || echo "[]")
+        CD_DISC_ID=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('disc_id',''))" "$_meta_tmp" 2>/dev/null || echo "")
+        CD_SUBMISSION_URL=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('submission_url',''))" "$_meta_tmp" 2>/dev/null || echo "")
     fi
     rm -f "$_meta_tmp"
 
-    log "Metadata: Artist=$CD_ARTIST, Album=$CD_ALBUM"
+    if [ -n "$CD_DISC_ID" ]; then
+        log "Metadata: Artist=$CD_ARTIST, Album=$CD_ALBUM, Disc ID=$CD_DISC_ID"
+    else
+        log "Metadata: Artist=$CD_ARTIST, Album=$CD_ALBUM (no disc ID available)"
+    fi
 }
 
 # ---------- Rip log ----------
@@ -486,9 +514,11 @@ enqueue_audio_job() {
         cp -f "$STATUS_DIR/cover.jpg" "$staging_dir/cover.jpg"
     fi
 
-    local s_artist s_album
+    local s_artist s_album s_disc_id s_submission_url
     s_artist=$(json_escape "$artist")
     s_album=$(json_escape "$album")
+    s_disc_id=$(json_escape "${CD_DISC_ID:-}")
+    s_submission_url=$(json_escape "${CD_SUBMISSION_URL:-}")
 
     cat > "$tmpfile" <<ENDJOB
 {
@@ -499,7 +529,9 @@ enqueue_audio_job() {
     "staging_dir": "${staging_dir}",
     "format": "${CD_FORMAT:-mp3}",
     "source_host": "$HOSTNAME",
-    "submitted": "$(date '+%Y-%m-%d %H:%M:%S')"
+    "submitted": "$(date '+%Y-%m-%d %H:%M:%S')",
+    "disc_id": "${s_disc_id}",
+    "submission_url": "${s_submission_url}"
 }
 ENDJOB
     mv -f "$tmpfile" "$job_file"
@@ -767,14 +799,36 @@ if $is_audio_cd; then
             "$cd_track_count" "$cd_track_count" ""
         log "Audio CD rip complete"
 
-        # Locate the staging directory abcde created
+        # Locate the staging directory abcde created.
+        # abcde uses its own MusicBrainz lookup for file paths, which may
+        # differ from our fetch_cd_metadata result (especially for unknown
+        # discs where we add a disc-id suffix).  Try our name first, then
+        # abcde's likely generic name, then a catch-all find.
         artist_dir=$(echo "$CD_ARTIST" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
         album_dir=$(echo "$CD_ALBUM" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
         staging_album="$STAGING_DIR/$artist_dir/$album_dir"
 
         if [ ! -d "$staging_album" ]; then
-            # Fallback: find the most recently created directory in staging
+            # abcde may have used a different (generic) name for unknown discs
             staging_album=$(find "$STAGING_DIR" -mindepth 2 -maxdepth 2 -type d -newer "$LOCKFILE" 2>/dev/null | head -1)
+        fi
+
+        # For unknown discs, rename the staging dir to include the disc-id
+        # so multiple unknown CDs don't clobber each other.
+        if [ -d "$staging_album" ] && [ "$CD_ARTIST" = "Unknown Artist" ]; then
+            local unique_dir="$STAGING_DIR/$artist_dir/$album_dir"
+            if [ "$staging_album" != "$unique_dir" ]; then
+                mkdir -p "$STAGING_DIR/$artist_dir"
+                mv "$staging_album" "$unique_dir"
+                log "Renamed staging to unique path: $unique_dir"
+                # Clean up empty parent if abcde used a generic name
+                local old_parent
+                old_parent=$(dirname "$staging_album")
+                if [ -d "$old_parent" ] && [ "$(basename "$old_parent")" != ".autorip-staging" ]; then
+                    rmdir "$old_parent" 2>/dev/null || true
+                fi
+                staging_album="$unique_dir"
+            fi
         fi
 
         if [ -d "$staging_album" ]; then
