@@ -63,6 +63,16 @@ AGENT_PORT = int(_config.get("AGENT_PORT", "7800"))
 QUEUE_DIR = os.path.join(OUTPUT_BASE, ".autorip-queue")
 
 
+def _valid_job_id(job_id):
+    """Validate a job_id: block path traversal while allowing Unicode filenames."""
+    if not job_id or "\0" in job_id or "/" in job_id or "\\" in job_id:
+        return False
+    # Prevent ".." path components
+    if ".." in job_id:
+        return False
+    return True
+
+
 def read_transcode_queue():
     """Read all transcode job files from the shared queue directory.
 
@@ -447,7 +457,7 @@ def review_edit():
     fields = request.json.get("fields", {})
     if not job_id:
         return jsonify({"error": "Missing job_id"}), 400
-    if not re.match(r"^[\w.\-,:()\[\] ]+$", job_id):
+    if not _valid_job_id(job_id):
         return jsonify({"error": "Invalid job_id"}), 400
     if not fields:
         return jsonify({"error": "No fields to update"}), 400
@@ -506,8 +516,8 @@ def review_approve():
     job_id = request.json.get("job_id", "") if request.is_json else ""
     if not job_id:
         return jsonify({"error": "Missing job_id"}), 400
-    # Sanitise: only allow expected filename characters
-    if not re.match(r"^[\w.\-,:()\[\] ]+$", job_id):
+    # Sanitise: block path traversal while allowing Unicode filenames
+    if not _valid_job_id(job_id):
         return jsonify({"error": "Invalid job_id"}), 400
     result = subprocess.run(
         [WORKER_SCRIPT, "approve", job_id],
@@ -524,7 +534,7 @@ def review_reject():
     job_id = request.json.get("job_id", "") if request.is_json else ""
     if not job_id:
         return jsonify({"error": "Missing job_id"}), 400
-    if not re.match(r"^[\w.\-,:()\[\] ]+$", job_id):
+    if not _valid_job_id(job_id):
         return jsonify({"error": "Invalid job_id"}), 400
     result = subprocess.run(
         [WORKER_SCRIPT, "reject", job_id],
