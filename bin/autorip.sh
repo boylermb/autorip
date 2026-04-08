@@ -486,6 +486,22 @@ if ! flock -n 200; then
     exit 0
 fi
 
+# ---------- Cooldown to prevent re-trigger after eject ----------
+# Some drives auto-close the tray after eject, which fires a new udev event
+# and re-triggers this script.  Ignore events within COOLDOWN_SECONDS of a
+# previous successful rip.
+COOLDOWN_SECONDS=60
+COOLDOWN_FILE="$LOCK_DIR/$(basename "$DEVICE").cooldown"
+if [ -f "$COOLDOWN_FILE" ]; then
+    last_rip=$(cat "$COOLDOWN_FILE" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    elapsed=$(( now - last_rip ))
+    if [ "$elapsed" -lt "$COOLDOWN_SECONDS" ]; then
+        log "Cooldown active (${elapsed}s < ${COOLDOWN_SECONDS}s since last rip) — ignoring re-trigger."
+        exit 0
+    fi
+fi
+
 # ---------- Wait for drive to become ready ----------
 DRIVE_READY_TIMEOUT=90
 DRIVE_READY_INTERVAL=3
@@ -663,6 +679,7 @@ if $is_audio_cd; then
             log "Ejecting disc (duplicate)..."
             sleep 2
             eject "$DEVICE" 2>/dev/null || true
+            date +%s > "$COOLDOWN_FILE"
             update_status "idle"
             log "Done (skipped duplicate)."
             exit 0
@@ -744,5 +761,6 @@ fi
 log "Ejecting disc..."
 sleep 2
 eject "$DEVICE" 2>/dev/null || true
+date +%s > "$COOLDOWN_FILE"
 update_status "idle"
 log "Done."
