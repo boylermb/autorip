@@ -44,6 +44,7 @@ MOVIES_DIR="$OUTPUT_BASE/Video/Movies"
 TV_DIR="$OUTPUT_BASE/Video/TV"
 MUSIC_DIR="$OUTPUT_BASE/Audio/Music"
 RIP_LOG="$OUTPUT_BASE/.rip-log.json"
+RIP_LOG_MD="$OUTPUT_BASE/.rip-log.md"
 STATUS_FILE="$OUTPUT_BASE/.autorip-queue/.worker-status.json"
 HOSTNAME=$(hostname)
 
@@ -112,9 +113,123 @@ print(json.dumps(log, indent=2))
     ) 201>"${RIP_LOG}.lock"
 
     log "Rip logged: $disc_type — $artist / $album"
+
+    # Regenerate the markdown version of the rip log
+    generate_rip_log_markdown
 }
 
-# ---------- Worker status (read by dashboard) ----------
+# ---------- Rip log → Markdown ----------
+# Regenerate .rip-log.md from .rip-log.json.  Called after every log_rip_entry().
+# Image paths use the dashboard's /api/rip-log/art proxy.
+generate_rip_log_markdown() {
+    [ -f "$RIP_LOG" ] || return
+    python3 - "$RIP_LOG" "$RIP_LOG_MD" <<'PYEOF' 2>/dev/null || log "WARNING: Markdown generation failed"
+import json, sys, urllib.parse
+from datetime import datetime
+
+rip_log_path = sys.argv[1]
+md_path = sys.argv[2]
+
+with open(rip_log_path) as f:
+    entries = json.load(f)
+
+lines = []
+lines.append("# Verified Media Library")
+lines.append("")
+lines.append(f"*{len(entries)} verified rip{'s' if len(entries) != 1 else ''}*")
+lines.append("")
+
+# Group by disc_type
+audio = [e for e in entries if e.get("disc_type") == "Audio CD"]
+video = [e for e in entries if e.get("disc_type") != "Audio CD"]
+
+if audio:
+    lines.append("## 🎵 Audio CDs")
+    lines.append("")
+    # Sort by artist, then album
+    for entry in sorted(audio, key=lambda e: (e.get("artist", "").lower(), e.get("album", "").lower())):
+        artist = entry.get("artist", "Unknown Artist")
+        album = entry.get("album", "Unknown Album")
+        tracks = entry.get("tracks", [])
+        cover = entry.get("cover_art", "")
+        hostname = entry.get("hostname", "")
+        ts = entry.get("timestamp", "")
+
+        # Format date
+        date_str = ""
+        if ts:
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                date_str = dt.strftime("%b %d, %Y")
+            except Exception:
+                date_str = ts
+
+        lines.append(f"### {artist} — {album}")
+        lines.append("")
+
+        # Album art (uses dashboard proxy)
+        if cover:
+            art_url = f"/api/rip-log/art?path={urllib.parse.quote(cover)}"
+            lines.append(f"![{artist} — {album}]({art_url})")
+            lines.append("")
+
+        # Navidrome link
+        album_filter = json.dumps({"name": album})
+        nav_url = f"https://music.home.lan/app/#/album?filter={urllib.parse.quote(album_filter)}&order=ASC&sort=name"
+        meta_parts = []
+        if hostname:
+            meta_parts.append(f"Ripped on **{hostname}**")
+        if date_str:
+            meta_parts.append(date_str)
+        meta_parts.append(f"[🎧 Listen on Navidrome]({nav_url})")
+        lines.append(" · ".join(meta_parts))
+        lines.append("")
+
+        # Track listing
+        if tracks:
+            for i, track in enumerate(tracks, 1):
+                lines.append(f"{i}. {track}")
+            lines.append("")
+
+        lines.append("---")
+        lines.append("")
+
+if video:
+    lines.append("## 📀 Video")
+    lines.append("")
+    for entry in sorted(video, key=lambda e: e.get("album", e.get("title", "")).lower()):
+        title = entry.get("album") or entry.get("title") or "Unknown"
+        hostname = entry.get("hostname", "")
+        ts = entry.get("timestamp", "")
+        disc_type = entry.get("disc_type", "Video")
+
+        date_str = ""
+        if ts:
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                date_str = dt.strftime("%b %d, %Y")
+            except Exception:
+                date_str = ts
+
+        lines.append(f"### {title}")
+        lines.append("")
+        meta_parts = [disc_type]
+        if hostname:
+            meta_parts.append(f"ripped on **{hostname}**")
+        if date_str:
+            meta_parts.append(date_str)
+        lines.append(" · ".join(meta_parts))
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+md_content = "\n".join(lines)
+with open(md_path + ".tmp", "w") as f:
+    f.write(md_content)
+import os
+os.replace(md_path + ".tmp", md_path)
+PYEOF
+}
 update_worker_status() {
     local state="$1"
     local job_file="${2:-}"

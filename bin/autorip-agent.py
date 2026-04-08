@@ -409,6 +409,15 @@ def rip_log_art():
     abort(404)
 
 
+@app.route("/rip-log/markdown")
+def rip_log_markdown():
+    """Serve the generated rip-log markdown file."""
+    md_path = os.path.join(OUTPUT_BASE, ".rip-log.md")
+    if os.path.isfile(md_path):
+        return send_file(md_path, mimetype="text/markdown; charset=utf-8")
+    abort(404)
+
+
 WORKER_SCRIPT = os.path.join(
     _config.get("PREFIX", "/usr/local"), "bin", "transcode-worker.sh"
 )
