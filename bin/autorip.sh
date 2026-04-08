@@ -174,27 +174,56 @@ outfile = sys.argv[2]
 try:
     import discid
     disc = discid.read(sys.argv[1])
+    disc_id = disc.id
 
     import musicbrainzngs
     musicbrainzngs.set_useragent('autorip', '1.0', 'https://github.com/boylermb/autorip')
-    result = musicbrainzngs.get_releases_by_discid(disc.id, includes=['artists', 'recordings'])
+    result = musicbrainzngs.get_releases_by_discid(disc_id, includes=['artists', 'recordings'])
     releases = result.get('disc', {}).get('release-list', [])
 
     if releases:
         release = releases[0]
         artist = release.get('artist-credit-phrase', 'Unknown Artist')
         album = release.get('title', 'Unknown Album')
+        medium_list = release.get('medium-list', [])
+        disc_total = len(medium_list)
+
+        # Find the medium that matches our disc ID
+        matched_medium = None
+        disc_number = 1
+        for medium in medium_list:
+            for md in medium.get('disc-list', []):
+                if md.get('id') == disc_id:
+                    matched_medium = medium
+                    disc_number = int(medium.get('position', 1))
+                    break
+            if matched_medium:
+                break
+
+        # Fallback: use the first medium if no disc-list match
+        if not matched_medium and medium_list:
+            matched_medium = medium_list[0]
+            disc_number = int(matched_medium.get('position', 1))
+
         tracks = []
-        for medium in release.get('medium-list', []):
-            for track in medium.get('track-list', []):
+        if matched_medium:
+            for track in matched_medium.get('track-list', []):
                 rec = track.get('recording', {})
                 tracks.append(rec.get('title', 'Track ' + track.get('number', '?')))
-        meta = {"artist": artist, "album": album, "tracks": tracks}
+
+        # Append disc number to album when multi-disc release
+        if disc_total > 1:
+            album = album + ' (Disc ' + str(disc_number) + ')'
+
+        meta = {"artist": artist, "album": album, "tracks": tracks,
+                "disc_number": disc_number, "disc_total": disc_total}
     else:
-        meta = {"artist": "Unknown Artist", "album": "Unknown Album", "tracks": []}
+        meta = {"artist": "Unknown Artist", "album": "Unknown Album", "tracks": [],
+                "disc_number": 1, "disc_total": 1}
 except Exception as e:
     print('# metadata lookup failed: ' + str(e), file=sys.stderr)
-    meta = {"artist": "Unknown Artist", "album": "Unknown Album", "tracks": []}
+    meta = {"artist": "Unknown Artist", "album": "Unknown Album", "tracks": [],
+            "disc_number": 1, "disc_total": 1}
 
 with open(outfile, 'w') as f:
     json.dump(meta, f)
@@ -666,7 +695,12 @@ if $is_audio_cd; then
     # Count tracks from metadata for duplicate check
     cd_track_count=0
     if [ "$CD_TRACKS_JSON" != "[]" ]; then
-        cd_track_count=$(python3 -c "import json, sys; print(len(json.loads(sys.stdin.read())))" <<< "$CD_TRACKS_JSON" 2>/dev/null || echo 0)
+        cd_track_count=$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$CD_TRACKS_JSON" 2>/dev/null || true)
+        cd_track_count="${cd_track_count:-0}"
+        # Ensure it's a plain integer
+        if ! [[ "$cd_track_count" =~ ^[0-9]+$ ]]; then
+            cd_track_count=0
+        fi
     fi
 
     # Check if this album already exists in the library
