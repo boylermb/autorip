@@ -348,6 +348,16 @@ for t in tracks:
     # Run `transcode-worker.sh clean` to purge reviewed staging dirs.
     log "Staging kept for review: $staging_dir"
 
+    # Record original library destination so approve can clean it up if metadata is edited
+    python3 -c "
+import json, sys
+with open(sys.argv[1], 'r') as f:
+    data = json.load(f)
+data['_original_dest'] = sys.argv[2]
+with open(sys.argv[1], 'w') as f:
+    json.dump(data, f, indent=2)
+" "$processing_file" "$final_dir" 2>/dev/null || true
+
     # Mark job as needing review (staging still present)
     mv "$processing_file" "${processing_file%.processing}.review"
     log "Audio CD job complete (pending review): $artist / $album ($file_num tracks)"
@@ -589,36 +599,155 @@ approve_single() {
 
     log "Approving single job: $(basename "$review_file")"
 
-    # Extract job info and log to rip history
-    local job_type="" artist="" album="" staging_dir="" file_path=""
+    # Extract job info
+    local job_type="" artist="" album="" staging_dir="" file_path="" format=""
     job_type=$(grep -oP '"job_type"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || echo "video")
     artist=$(grep -oP '"artist"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
     album=$(grep -oP '"album"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
     staging_dir=$(grep -oP '"staging_dir"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
+    format=$(grep -oP '"format"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || echo "mp3")
 
     if [ -z "$staging_dir" ]; then
         file_path=$(grep -oP '"file_path"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
         staging_dir=$(dirname "$file_path" 2>/dev/null || echo "")
     fi
 
-    # Log to rip history
-    if [ "$job_type" = "audio-cd" ] && [ -n "$artist" ] && [ -n "$album" ]; then
-        local tracks_json format
+    # Re-process from staging with (potentially edited) metadata
+    if [ "$job_type" = "audio-cd" ] && [ -n "$artist" ] && [ -n "$album" ] && [ -n "$staging_dir" ] && [ -d "$staging_dir" ]; then
+        local tracks_json
         tracks_json=$(python3 -c "
 import json, sys
 with open(sys.argv[1]) as f:
     job = json.load(f)
 print(json.dumps(job.get('tracks', [])))
 " "$review_file" 2>/dev/null || echo "[]")
-        format=$(grep -oP '"format"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || echo "mp3")
 
-        local safe_artist safe_album cover_rel=""
+        local ext="$format"
+        local safe_artist safe_album
         safe_artist=$(echo "$artist" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
         safe_album=$(echo "$album" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
-        if [ -f "$MUSIC_DIR/$safe_artist/$safe_album/cover.jpg" ]; then
+
+        # Remove old library output (in case metadata was edited and dest changed)
+        # Find previous dest from the original metadata on disk — just clean any
+        # matching dir and rebuild from staging.
+        local final_dir="$MUSIC_DIR/$safe_artist/$safe_album"
+
+        # Also try to clean up any old dest that might differ (e.g. if artist/album was edited).
+        # We search for dirs containing files from the same staging batch by looking at the
+        # original job metadata before edits, but since we only have the current (edited)
+        # metadata, the simplest approach is: remove ALL matching library dirs that were
+        # created during the initial process_audio_cd_job.  The initial processing always
+        # writes to the same Artist/Album path computed from the JSON, so if the JSON was
+        # edited after processing, the old dir still exists under the old name.
+        # To handle this, we store the original dest in the review file.
+        local original_dir=""
+        original_dir=$(grep -oP '"_original_dest"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
+        if [ -n "$original_dir" ] && [ -d "$original_dir" ] && [ "$original_dir" != "$final_dir" ]; then
+            log "Removing old library dir (metadata was edited): $original_dir"
+            rm -rf "$original_dir"
+            local old_parent
+            old_parent=$(dirname "$original_dir")
+            if [ -d "$old_parent" ] && [ "$(basename "$old_parent")" != "Music" ]; then
+                rmdir "$old_parent" 2>/dev/null || true
+            fi
+        fi
+
+        # (Re)create final dir and process from staging
+        mkdir -p "$final_dir"
+
+        local -a track_names
+        while IFS= read -r name; do
+            track_names+=("$name")
+        done < <(python3 -c "
+import json, sys
+tracks = json.loads(sys.argv[1])
+for t in tracks:
+    print(t)
+" "$tracks_json" 2>/dev/null)
+
+        local track_count=${#track_names[@]}
+
+        # Remove any previously copied files in final_dir before re-processing
+        find "$final_dir" -maxdepth 1 -name "*.$ext" -delete 2>/dev/null || true
+
+        local file_num=0
+        while IFS= read -r audio_file; do
+            [ -f "$audio_file" ] || continue
+            file_num=$((file_num + 1))
+
+            local tracknum
+            tracknum=$(printf '%02d' "$file_num")
+            local track_name=""
+            if [ "$file_num" -le "$track_count" ]; then
+                track_name="${track_names[$((file_num - 1))]}"
+            fi
+
+            # Re-tag the file
+            if [ "$ext" = "mp3" ] && command -v eyeD3 >/dev/null 2>&1; then
+                local eyeD3_args=()
+                eyeD3_args+=(--artist "$artist")
+                eyeD3_args+=(--album "$album")
+                eyeD3_args+=(--track "$file_num")
+                if [ -n "$track_name" ]; then
+                    eyeD3_args+=(--title "$track_name")
+                fi
+                if [ -f "$staging_dir/cover.jpg" ]; then
+                    eyeD3_args+=(--add-image "$staging_dir/cover.jpg:FRONT_COVER")
+                fi
+                eyeD3 "${eyeD3_args[@]}" "$audio_file" 2>&1 || true
+            elif [ "$ext" = "flac" ] && command -v metaflac >/dev/null 2>&1; then
+                metaflac --remove-all-tags "$audio_file" 2>/dev/null || true
+                metaflac --set-tag="ARTIST=$artist" \
+                         --set-tag="ALBUM=$album" \
+                         --set-tag="TRACKNUMBER=$file_num" \
+                         "$audio_file" 2>&1 || true
+                if [ -n "$track_name" ]; then
+                    metaflac --set-tag="TITLE=$track_name" "$audio_file" 2>&1 || true
+                fi
+                if [ -f "$staging_dir/cover.jpg" ]; then
+                    metaflac --import-picture-from="$staging_dir/cover.jpg" "$audio_file" 2>&1 || true
+                fi
+            fi
+
+            local new_name
+            if [ -n "$track_name" ]; then
+                local safe_track
+                safe_track=$(echo "$track_name" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
+                new_name="${tracknum} - ${safe_track}.${ext}"
+            else
+                new_name="${tracknum}.${ext}"
+            fi
+            cp -f "$audio_file" "$final_dir/$new_name"
+            log "  → $new_name"
+        done < <(find "$staging_dir" -maxdepth 1 -name "*.$ext" 2>/dev/null | sort)
+
+        if [ -f "$staging_dir/cover.jpg" ]; then
+            cp -f "$staging_dir/cover.jpg" "$final_dir/cover.jpg"
+        fi
+
+        log "Re-processed $file_num track(s) to $final_dir"
+
+        # Log to rip history
+        local cover_rel=""
+        if [ -f "$final_dir/cover.jpg" ]; then
             cover_rel="Audio/Music/$safe_artist/$safe_album/cover.jpg"
         fi
         log_rip_entry "Audio CD" "$artist" "$album" "$tracks_json" "$cover_rel"
+    elif [ "$job_type" != "audio-cd" ]; then
+        # Video jobs: if disc_title was edited, re-run rename from staging
+        local disc_title
+        disc_title=$(grep -oP '"disc_title"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
+        file_path=$(grep -oP '"file_path"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
+        local title_index
+        title_index=$(grep -oP '"title_index"\s*:\s*\K[0-9]+' "$review_file" 2>/dev/null || echo "0")
+
+        if [ -n "$disc_title" ] && [ -n "$file_path" ] && [ -f "$file_path" ]; then
+            if parse_tv_disc_title "$disc_title"; then
+                tv_rename_file "$file_path" "$title_index"
+            else
+                movie_rename_file "$file_path" "$disc_title"
+            fi
+        fi
     fi
 
     # Clean staging directory

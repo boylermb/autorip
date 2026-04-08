@@ -10,6 +10,8 @@ Provides:
     POST /rip             — Trigger a rip on the specified device
     POST /eject           — Eject the specified device
     GET  /transcode-queue — Shared GPU transcode queue state
+    GET  /review/jobs     — List all jobs pending review with metadata
+    POST /review/edit     — Edit metadata of a review job before approval
     POST /review/approve  — Approve a single reviewed job
     POST /review/reject   — Reject a single reviewed job
     GET  /health          — Health check
@@ -400,6 +402,96 @@ def rip_log_art():
 WORKER_SCRIPT = os.path.join(
     _config.get("PREFIX", "/usr/local"), "bin", "transcode-worker.sh"
 )
+
+
+@app.route("/review/jobs")
+def review_jobs():
+    """List all jobs in the review state with full metadata."""
+    jobs = []
+    if not os.path.isdir(QUEUE_DIR):
+        return jsonify({"jobs": jobs})
+
+    for entry in sorted(os.listdir(QUEUE_DIR)):
+        if not entry.endswith(".review"):
+            continue
+        filepath = os.path.join(QUEUE_DIR, entry)
+        try:
+            with open(filepath, "r") as f:
+                data = json.load(f)
+            data["job_file"] = entry
+            data["job_id"] = entry.removesuffix(".review")
+            # Check staging exists
+            sdir = data.get("staging_dir", "")
+            if sdir:
+                data["staging_exists"] = os.path.isdir(sdir)
+            fpath = data.get("file_path", "")
+            if fpath:
+                data["file_exists"] = os.path.isfile(fpath)
+            jobs.append(data)
+        except (json.JSONDecodeError, OSError):
+            jobs.append({"job_file": entry, "job_id": entry.removesuffix(".review"),
+                         "error": "unreadable"})
+    return jsonify({"jobs": jobs})
+
+
+@app.route("/review/edit", methods=["POST"])
+def review_edit():
+    """Edit metadata fields of a review job before approving.
+
+    Accepts JSON: { "job_id": "...", "fields": { "artist": "...", "album": "...", "tracks": [...] } }
+    Only allows editing known metadata fields in .review files.
+    """
+    if not request.is_json:
+        return jsonify({"error": "JSON body required"}), 400
+    job_id = request.json.get("job_id", "")
+    fields = request.json.get("fields", {})
+    if not job_id:
+        return jsonify({"error": "Missing job_id"}), 400
+    if not re.match(r"^[\w.\-,:()\[\] ]+$", job_id):
+        return jsonify({"error": "Invalid job_id"}), 400
+    if not fields:
+        return jsonify({"error": "No fields to update"}), 400
+
+    # Only allow editing safe metadata fields
+    EDITABLE_FIELDS = {"artist", "album", "tracks", "disc_title"}
+    unknown = set(fields.keys()) - EDITABLE_FIELDS
+    if unknown:
+        return jsonify({"error": f"Cannot edit fields: {', '.join(unknown)}"}), 400
+
+    # Find the .review file
+    review_file = None
+    for f in os.listdir(QUEUE_DIR):
+        if not f.endswith(".review"):
+            continue
+        base = f.removesuffix(".review")
+        if f == job_id or f == f"{job_id}.review" or base == job_id:
+            review_file = os.path.join(QUEUE_DIR, f)
+            break
+
+    if not review_file or not os.path.isfile(review_file):
+        return jsonify({"error": f"No review job found matching: {job_id}"}), 404
+
+    try:
+        with open(review_file, "r") as fh:
+            data = json.load(fh)
+    except (json.JSONDecodeError, OSError) as exc:
+        return jsonify({"error": f"Failed to read job: {exc}"}), 500
+
+    # Apply edits
+    for key, value in fields.items():
+        data[key] = value
+
+    # Write back atomically
+    tmp_path = review_file + ".tmp"
+    try:
+        with open(tmp_path, "w") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp_path, review_file)
+    except OSError as exc:
+        return jsonify({"error": f"Failed to write: {exc}"}), 500
+
+    return jsonify({"ok": True, "message": f"Updated {', '.join(fields.keys())}",
+                    "job": data})
 
 
 @app.route("/review/approve", methods=["POST"])

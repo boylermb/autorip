@@ -1,6 +1,10 @@
 # Build artifacts
 build/
 
+# Python
+__pycache__/
+*.pyc
+
 # Editor
 .vscode/
 *.swp
