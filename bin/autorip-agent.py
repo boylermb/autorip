@@ -570,7 +570,7 @@ def review_lookup():
     import urllib.error
     api_url = (
         f"https://musicbrainz.org/ws/2/release/{release_id}"
-        "?inc=artists+recordings&fmt=json"
+        "?inc=artists+recordings+discids&fmt=json"
     )
     api_req = urllib.request.Request(api_url)
     api_req.add_header("User-Agent", "autorip/1.0 (https://github.com/boylermb/autorip)")
@@ -610,8 +610,10 @@ def review_lookup():
         return jsonify({"error": f"Failed to read job: {exc}"}), 500
 
     job_disc_id = job_data.get("disc_id", "")
+    job_track_count = len(job_data.get("tracks", []))
     matched_medium = None
 
+    # Strategy 1: match by disc_id (most reliable)
     if job_disc_id:
         for medium in media:
             for disc in medium.get("discs", []):
@@ -622,6 +624,16 @@ def review_lookup():
             if matched_medium:
                 break
 
+    # Strategy 2: match by track count (for multi-disc releases where
+    # disc_id didn't match — e.g. the disc isn't in MB's disc ID list)
+    if not matched_medium and disc_total > 1 and job_track_count > 0:
+        for medium in media:
+            if len(medium.get("tracks", [])) == job_track_count:
+                matched_medium = medium
+                disc_number = int(medium.get("position", 1))
+                break
+
+    # Strategy 3: fall back to first medium
     if not matched_medium and media:
         matched_medium = media[0]
         disc_number = int(matched_medium.get("position", 1))
