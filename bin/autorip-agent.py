@@ -519,6 +519,140 @@ def review_edit():
                     "job": data})
 
 
+@app.route("/review/lookup", methods=["POST"])
+def review_lookup():
+    """Look up metadata from a MusicBrainz release URL and update a review job.
+
+    Accepts JSON: { "job_id": "...", "musicbrainz_url": "https://musicbrainz.org/release/..." }
+    Fetches artist, album, and track names from the MusicBrainz API and applies
+    them to the .review file (preserving original values for approve cleanup).
+    """
+    if not request.is_json:
+        return jsonify({"error": "JSON body required"}), 400
+    job_id = request.json.get("job_id", "")
+    mb_url = request.json.get("musicbrainz_url", "").strip()
+    if not job_id:
+        return jsonify({"error": "Missing job_id"}), 400
+    if not _valid_job_id(job_id):
+        return jsonify({"error": "Invalid job_id"}), 400
+    if not mb_url:
+        return jsonify({"error": "Missing musicbrainz_url"}), 400
+
+    # Extract release MBID from the URL
+    # Accepts: https://musicbrainz.org/release/<uuid>
+    #          https://musicbrainz.org/release/<uuid>#...
+    #          bare UUID
+    mb_release_re = re.compile(
+        r"(?:https?://(?:www\.)?musicbrainz\.org/release/)?"
+        r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+        re.IGNORECASE,
+    )
+    m = mb_release_re.search(mb_url)
+    if not m:
+        return jsonify({"error": "Could not parse MusicBrainz release ID from URL"}), 400
+    release_id = m.group(1).lower()
+
+    # Find the .review file
+    review_file = None
+    for f in os.listdir(QUEUE_DIR):
+        if not f.endswith(".review"):
+            continue
+        base = f.removesuffix(".review")
+        if f == job_id or f == f"{job_id}.review" or base == job_id:
+            review_file = os.path.join(QUEUE_DIR, f)
+            break
+
+    if not review_file or not os.path.isfile(review_file):
+        return jsonify({"error": f"No review job found matching: {job_id}"}), 404
+
+    # Fetch release metadata from the MusicBrainz JSON API
+    import urllib.request
+    import urllib.error
+    api_url = (
+        f"https://musicbrainz.org/ws/2/release/{release_id}"
+        "?inc=artists+recordings&fmt=json"
+    )
+    api_req = urllib.request.Request(api_url)
+    api_req.add_header("User-Agent", "autorip/1.0 (https://github.com/boylermb/autorip)")
+    try:
+        with urllib.request.urlopen(api_req, timeout=15) as resp:
+            mb_data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return jsonify({"error": f"MusicBrainz API returned HTTP {e.code}"}), 502
+    except (urllib.error.URLError, OSError) as e:
+        return jsonify({"error": f"MusicBrainz API unreachable: {e}"}), 502
+
+    artist = mb_data.get("artist-credit-phrase", "")
+    album = mb_data.get("title", "")
+    if not artist or not album:
+        return jsonify({"error": "MusicBrainz release missing artist or title"}), 502
+
+    # Extract track names from the first medium (or the medium matching disc_id)
+    media = mb_data.get("media", [])
+    tracks = []
+    disc_total = len(media)
+    disc_number = 1
+
+    # Try to match by disc_id if the review job has one
+    try:
+        with open(review_file, "r") as fh:
+            job_data = json.load(fh)
+    except (json.JSONDecodeError, OSError) as exc:
+        return jsonify({"error": f"Failed to read job: {exc}"}), 500
+
+    job_disc_id = job_data.get("disc_id", "")
+    matched_medium = None
+
+    if job_disc_id:
+        for medium in media:
+            for disc in medium.get("discs", []):
+                if disc.get("id") == job_disc_id:
+                    matched_medium = medium
+                    disc_number = int(medium.get("position", 1))
+                    break
+            if matched_medium:
+                break
+
+    if not matched_medium and media:
+        matched_medium = media[0]
+        disc_number = int(matched_medium.get("position", 1))
+
+    if matched_medium:
+        for track in matched_medium.get("tracks", []):
+            rec = track.get("recording", {})
+            tracks.append(rec.get("title", f"Track {track.get('number', '?')}"))
+
+    # Multi-disc: append disc number to album
+    if disc_total > 1:
+        album = f"{album} (Disc {disc_number})"
+
+    # Snapshot originals and apply the new metadata
+    fields = {"artist": artist, "album": album, "tracks": tracks}
+    for key, value in fields.items():
+        orig_key = f"_original_{key}"
+        if orig_key not in job_data and key in job_data:
+            job_data[orig_key] = job_data[key]
+        job_data[key] = value
+
+    # Write back atomically
+    tmp_path = review_file + ".tmp"
+    try:
+        with open(tmp_path, "w") as fh:
+            json.dump(job_data, fh, indent=2)
+        os.replace(tmp_path, review_file)
+    except OSError as exc:
+        return jsonify({"error": f"Failed to write: {exc}"}), 500
+
+    return jsonify({
+        "ok": True,
+        "message": f"Identified: {artist} — {album} ({len(tracks)} tracks)",
+        "artist": artist,
+        "album": album,
+        "tracks": tracks,
+        "job": job_data,
+    })
+
+
 @app.route("/review/approve", methods=["POST"])
 def review_approve():
     """Approve a single reviewed job — logs to rip history + cleans staging."""

@@ -816,13 +816,12 @@ if $is_audio_cd; then
         # For unknown discs, rename the staging dir to include the disc-id
         # so multiple unknown CDs don't clobber each other.
         if [ -d "$staging_album" ] && [ "$CD_ARTIST" = "Unknown Artist" ]; then
-            local unique_dir="$STAGING_DIR/$artist_dir/$album_dir"
+            unique_dir="$STAGING_DIR/$artist_dir/$album_dir"
             if [ "$staging_album" != "$unique_dir" ]; then
                 mkdir -p "$STAGING_DIR/$artist_dir"
                 mv "$staging_album" "$unique_dir"
                 log "Renamed staging to unique path: $unique_dir"
                 # Clean up empty parent if abcde used a generic name
-                local old_parent
                 old_parent=$(dirname "$staging_album")
                 if [ -d "$old_parent" ] && [ "$(basename "$old_parent")" != ".autorip-staging" ]; then
                     rmdir "$old_parent" 2>/dev/null || true
