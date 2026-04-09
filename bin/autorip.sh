@@ -778,8 +778,10 @@ OUTPUTDIR="$RIP_STAGING"
 ENDCONF
 
     # Run abcde in the background and monitor its output for per-track progress.
+    # -n = no CDDB/MusicBrainz lookup (we already did our own in fetch_cd_metadata;
+    #       letting abcde retry is redundant and can fail on SSL errors).
     ABCDE_LOG=$(mktemp /tmp/autorip-abcde.XXXXXX)
-    abcde -d "$DEVICE" -N -c "$RIP_CONF" > >(tee "$ABCDE_LOG" >&2) 2>&1 &
+    abcde -d "$DEVICE" -N -n -c "$RIP_CONF" > >(tee "$ABCDE_LOG" >&2) 2>&1 &
     ABCDE_PID=$!
 
     # Monitor abcde output for track progress
