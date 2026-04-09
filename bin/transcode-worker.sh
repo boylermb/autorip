@@ -379,6 +379,9 @@ print(json.dumps(job.get('tracks', [])))
     safe_album=$(echo "$album" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
     local final_dir="$MUSIC_DIR/$safe_artist/$safe_album"
     mkdir -p "$final_dir"
+    # Ensure the artist directory is also accessible
+    chown autorip:autorip "$MUSIC_DIR/$safe_artist" 2>/dev/null || true
+    chmod 777 "$MUSIC_DIR/$safe_artist" 2>/dev/null || true
 
     # Get track names as a bash array
     local -a track_names
@@ -456,6 +459,11 @@ for t in tracks:
         cp -f "$staging_dir/cover.jpg" "$final_dir/cover.jpg"
         log "Copied cover art to $final_dir"
     fi
+
+    # Make library files accessible to NFS clients (Picard, etc.)
+    chown -R autorip:autorip "$final_dir" 2>/dev/null || true
+    chmod 777 "$final_dir" 2>/dev/null || true
+    chmod 666 "$final_dir"/* 2>/dev/null || true
 
     # Rip log entry is deferred until review is approved (clean subcommand).
 
@@ -774,6 +782,8 @@ print(json.dumps(job.get('tracks', [])))
 
         # (Re)create final dir and process from staging
         mkdir -p "$final_dir"
+        chown autorip:autorip "$MUSIC_DIR/$safe_artist" 2>/dev/null || true
+        chmod 777 "$MUSIC_DIR/$safe_artist" 2>/dev/null || true
 
         local -a track_names
         while IFS= read -r name; do
@@ -844,6 +854,11 @@ for t in tracks:
         if [ -f "$staging_dir/cover.jpg" ]; then
             cp -f "$staging_dir/cover.jpg" "$final_dir/cover.jpg"
         fi
+
+        # Make library files accessible to NFS clients (Picard, etc.)
+        chown -R autorip:autorip "$final_dir" 2>/dev/null || true
+        chmod 777 "$final_dir" 2>/dev/null || true
+        chmod 666 "$final_dir"/* 2>/dev/null || true
 
         log "Re-processed $file_num track(s) to $final_dir"
 
