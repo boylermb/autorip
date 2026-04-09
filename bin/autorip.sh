@@ -755,13 +755,31 @@ if $is_audio_cd; then
 
     update_status "ripping" "Audio CD" "$CD_ALBUM" "Ripping track 1/$cd_track_count..." "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON" "$cd_track_count" "0" ""
 
-    # abcde rips and encodes to staging: .autorip-staging/Artist/Album/NN.mp3
-    # Tagging, renaming, and final move are handled by the post-process worker.
+    # ---------- Isolate abcde output to a per-rip staging directory ----------
+    # abcde does its own MusicBrainz lookup for directory naming, which may
+    # disagree with our fetch_cd_metadata result.  For unidentified discs
+    # it writes to a generic "Unknown Artist/Unknown Album/" path.  If two
+    # nodes rip unknown CDs at the same time, both would write to the same
+    # NFS-shared directory and clobber each other.
+    #
+    # Fix: give each rip its own private OUTPUTDIR via a temporary config
+    # overlay.  After the rip completes we locate the Artist/Album dir
+    # inside it and move it to the canonical staging path (which includes
+    # the disc-id for uniqueness).
+    RIP_STAGING=$(mktemp -d "$STAGING_DIR/.rip-XXXXXX")
+    log "Per-rip staging directory: $RIP_STAGING"
+
+    # Create a per-rip config overlay that sources the real config then
+    # overrides OUTPUTDIR.  abcde has no CLI flag for output directory.
+    RIP_CONF=$(mktemp /tmp/autorip-abcde-conf.XXXXXX)
+    cat > "$RIP_CONF" <<ENDCONF
+. /etc/abcde.conf
+OUTPUTDIR="$RIP_STAGING"
+ENDCONF
+
     # Run abcde in the background and monitor its output for per-track progress.
-    # Use a FIFO to tee output to both the log (stderr, captured by systemd)
-    # and a temp file we can grep for progress parsing.
     ABCDE_LOG=$(mktemp /tmp/autorip-abcde.XXXXXX)
-    abcde -d "$DEVICE" -N -c /etc/abcde.conf > >(tee "$ABCDE_LOG" >&2) 2>&1 &
+    abcde -d "$DEVICE" -N -c "$RIP_CONF" > >(tee "$ABCDE_LOG" >&2) 2>&1 &
     ABCDE_PID=$!
 
     # Monitor abcde output for track progress
@@ -790,7 +808,7 @@ if $is_audio_cd; then
     # abcde finished — get its exit code
     wait "$ABCDE_PID"
     abcde_rc=$?
-    rm -f "$ABCDE_LOG"
+    rm -f "$ABCDE_LOG" "$RIP_CONF"
 
     if [ "$abcde_rc" -eq 0 ]; then
         update_status "ripping" "Audio CD" "$CD_ALBUM" \
@@ -799,48 +817,43 @@ if $is_audio_cd; then
             "$cd_track_count" "$cd_track_count" ""
         log "Audio CD rip complete"
 
-        # Locate the staging directory abcde created.
-        # abcde uses its own MusicBrainz lookup for file paths, which may
-        # differ from our fetch_cd_metadata result (especially for unknown
-        # discs where we add a disc-id suffix).  Try our name first, then
-        # abcde's likely generic name, then a catch-all find.
+        # Locate the Artist/Album directory abcde created inside our
+        # isolated per-rip staging dir and move it to the canonical path.
         artist_dir=$(echo "$CD_ARTIST" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
         album_dir=$(echo "$CD_ALBUM" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
-        staging_album="$STAGING_DIR/$artist_dir/$album_dir"
 
+        # abcde creates Artist/Album/ inside RIP_STAGING.  Find the deepest
+        # directory — our expected path first, then whatever abcde created.
+        staging_album="$RIP_STAGING/$artist_dir/$album_dir"
         if [ ! -d "$staging_album" ]; then
-            # abcde may have used a different (generic) name for unknown discs
-            staging_album=$(find "$STAGING_DIR" -mindepth 2 -maxdepth 2 -type d -newer "$LOCKFILE" 2>/dev/null | head -1)
-        fi
-
-        # For unknown discs, rename the staging dir to include the disc-id
-        # so multiple unknown CDs don't clobber each other.
-        if [ -d "$staging_album" ] && [ "$CD_ARTIST" = "Unknown Artist" ]; then
-            unique_dir="$STAGING_DIR/$artist_dir/$album_dir"
-            if [ "$staging_album" != "$unique_dir" ]; then
-                mkdir -p "$STAGING_DIR/$artist_dir"
-                mv "$staging_album" "$unique_dir"
-                log "Renamed staging to unique path: $unique_dir"
-                # Clean up empty parent if abcde used a generic name
-                old_parent=$(dirname "$staging_album")
-                if [ -d "$old_parent" ] && [ "$(basename "$old_parent")" != ".autorip-staging" ]; then
-                    rmdir "$old_parent" 2>/dev/null || true
-                fi
-                staging_album="$unique_dir"
-            fi
+            staging_album=$(find "$RIP_STAGING" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | head -1)
         fi
 
         if [ -d "$staging_album" ]; then
+            # Move to the canonical staging path: STAGING_DIR/Artist/Album/
+            # The album_dir already contains the disc-id suffix for unknown
+            # discs (e.g. "Unknown Album (a3f7c1b2)") so the path is unique.
+            canonical_dir="$STAGING_DIR/$artist_dir/$album_dir"
+            mkdir -p "$STAGING_DIR/$artist_dir"
+            mv "$staging_album" "$canonical_dir"
+            log "Moved rip output to canonical staging: $canonical_dir"
+            staging_album="$canonical_dir"
+
+            # Clean up the now-empty per-rip directory
+            rm -rf "$RIP_STAGING"
+
             # Enqueue post-processing job
             enqueue_audio_job "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON" "$staging_album"
             update_status "complete" "Audio CD" "$CD_ALBUM" "Queued for post-processing" "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON"
         else
-            log "ERROR: Could not find staging directory for $CD_ARTIST / $CD_ALBUM"
+            log "ERROR: Could not find staging directory inside $RIP_STAGING for $CD_ARTIST / $CD_ALBUM"
+            rm -rf "$RIP_STAGING"
             update_status "error" "Audio CD" "$CD_ALBUM" "Staging dir not found" "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON"
             exit 1
         fi
     else
         log "ERROR: abcde failed for Audio CD rip"
+        rm -rf "$RIP_STAGING"
         update_status "error" "Audio CD" "$CD_ALBUM" "abcde failed" "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON"
         exit 1
     fi
