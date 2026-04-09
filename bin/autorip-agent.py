@@ -582,8 +582,17 @@ def review_lookup():
     except (urllib.error.URLError, OSError) as e:
         return jsonify({"error": f"MusicBrainz API unreachable: {e}"}), 502
 
-    artist = mb_data.get("artist-credit-phrase", "")
-    album = mb_data.get("title", "")
+    artist = mb_data.get("artist-credit-phrase") or ""
+    # Fallback: build artist from artist-credit array if phrase is null
+    if not artist:
+        credits = mb_data.get("artist-credit", [])
+        if credits:
+            artist = "".join(
+                c.get("name", c.get("artist", {}).get("name", ""))
+                + c.get("joinphrase", "")
+                for c in credits
+            ).strip()
+    album = mb_data.get("title") or ""
     if not artist or not album:
         return jsonify({"error": "MusicBrainz release missing artist or title"}), 502
 

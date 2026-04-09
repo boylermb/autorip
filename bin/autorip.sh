@@ -198,8 +198,19 @@ if disc_id:
         if releases:
             found = True
             release = releases[0]
-            artist = release.get('artist-credit-phrase', 'Unknown Artist')
-            album = release.get('title', 'Unknown Album')
+            artist = release.get('artist-credit-phrase') or 'Unknown Artist'
+            # Fallback: build from artist-credit array if phrase is null
+            if artist == 'Unknown Artist':
+                credits = release.get('artist-credit', [])
+                if credits:
+                    built = ''.join(
+                        c.get('name', c.get('artist', {}).get('name', ''))
+                        + c.get('joinphrase', '')
+                        for c in credits if isinstance(c, dict)
+                    ).strip()
+                    if built:
+                        artist = built
+            album = release.get('title') or 'Unknown Album'
             medium_list = release.get('medium-list', [])
             disc_total = len(medium_list)
 
