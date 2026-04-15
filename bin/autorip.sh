@@ -650,14 +650,24 @@ rip_video_disc() {
 
     log "Starting $disc_type rip..."
 
-    # Grab full MakeMKV info output — used for disc title and UHD detection
-    MAKEMKV_INFO=$(makemkvcon -r info dev:"$DEVICE" 2>/dev/null || true)
+    # Single MakeMKV info pass — captures disc title, UHD markers, and title list.
+    # Robot-mode outputs CINFO/TINFO/TCOUNT on stdout; stderr is suppressed.
+    log "Scanning disc for titles (minlength=${MIN_TITLE_SECONDS}s)..."
+    update_status "ripping" "$disc_type" "" "Scanning titles..." "" "" "[]"
+    MAKEMKV_INFO=$(makemkvcon -r info dev:"$DEVICE" --minlength="$MIN_TITLE_SECONDS" 2>/dev/null || true)
 
-    DISC_TITLE=$(echo "$MAKEMKV_INFO" | grep "^DRV:0" | cut -d',' -f6 | tr -d '"' | tr ' ' '_' || echo "")
+    # --- Disc title ---
+    # CINFO:32 = volume label (e.g. "APOLLO13_UHD_UPK1") — safe for folder names.
+    # Fall back to CINFO:2 (human-friendly name) if 32 is missing.
+    DISC_TITLE=$(echo "$MAKEMKV_INFO" | grep '^CINFO:32,' | head -1 | sed 's/^CINFO:32,[^,]*,//; s/^"//; s/"$//' | tr ' ' '_' || echo "")
+    if [ -z "$DISC_TITLE" ]; then
+        DISC_TITLE=$(echo "$MAKEMKV_INFO" | grep '^CINFO:2,' | head -1 | sed 's/^CINFO:2,[^,]*,//; s/^"//; s/"$//' | tr ' ' '_' || echo "")
+    fi
     if [ -z "$DISC_TITLE" ]; then
         DISC_TITLE="$fallback_title"
         log "WARNING: Could not determine disc title, using $DISC_TITLE"
     fi
+    log "Disc title: $DISC_TITLE"
 
     # ---------- UHD Blu-ray detection ----------
     # MakeMKV reports "AACS2" or "BDMV 4K" for UHD discs.  Check the info
@@ -677,16 +687,15 @@ rip_video_disc() {
         fi
     fi
 
-    log "Scanning disc for titles (minlength=${MIN_TITLE_SECONDS}s)..."
     update_status "ripping" "$disc_type" "$DISC_TITLE" "Scanning titles..." "" "$DISC_TITLE" "[]"
 
+    # --- Title list ---
+    # Parse TINFO lines — each TINFO:N,... line represents a title that passed
+    # the --minlength filter.  Extract unique title indices (field before first comma).
     TITLE_IDS=()
-    while IFS= read -r line; do
-        title_1idx=$(echo "$line" | grep -oP 'Title #\K[0-9]+')
-        if [ -n "$title_1idx" ]; then
-            TITLE_IDS+=( $((title_1idx - 1)) )
-        fi
-    done < <(makemkvcon -r info dev:"$DEVICE" --minlength="$MIN_TITLE_SECONDS" 2>&1 | grep "^MSG:3028")
+    while IFS= read -r tid; do
+        TITLE_IDS+=( "$tid" )
+    done < <(echo "$MAKEMKV_INFO" | grep '^TINFO:' | cut -d',' -f1 | sed 's/^TINFO://' | sort -un)
 
     TITLE_COUNT=${#TITLE_IDS[@]}
     if [ "$TITLE_COUNT" -eq 0 ]; then
