@@ -26,6 +26,7 @@ MIN_TITLE_SECONDS = $(shell grep '^MIN_TITLE_SECONDS' "$(CONF_FILE)" 2>/dev/null
 CD_FORMAT        = $(shell grep '^CD_FORMAT'        "$(CONF_FILE)" 2>/dev/null | head -1 | cut -d= -f2- | tr -d ' "')
 MAX_ENCODE_PROCS = $(shell grep '^MAX_ENCODE_PROCS' "$(CONF_FILE)" 2>/dev/null | head -1 | cut -d= -f2- | tr -d ' "')
 AGENT_PORT       = $(shell grep '^AGENT_PORT'       "$(CONF_FILE)" 2>/dev/null | head -1 | cut -d= -f2- | tr -d ' "')
+UHD_KEEP_ORIGINAL = $(shell grep '^UHD_KEEP_ORIGINAL' "$(CONF_FILE)" 2>/dev/null | head -1 | cut -d= -f2- | tr -d ' "')
 WRITABLE_PATHS   = $(shell grep '^WRITABLE_PATHS'   "$(CONF_FILE)" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"')
 
 .PHONY: install install-worker install-makemkv install-deps configure uninstall help

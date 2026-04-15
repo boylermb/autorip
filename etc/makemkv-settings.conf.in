@@ -4,6 +4,8 @@
 #
 # Selection profile: include all audio and subtitle tracks by default
 # This ensures DVD/Blu-ray rips always contain audio streams.
+# UHD Blu-ray: HDR metadata and Dolby Vision layers are preserved
+# automatically when all video streams are selected.
 
 # Selection string: select all video, all audio, and all subtitles
 app_DefaultSelectionString = "+sel:all"
@@ -16,6 +18,14 @@ app_MinimumTitleLength = "@@MIN_TITLE_SECONDS@@"
 
 # Use MakeMKV's built-in decryption (LibreDrive when available)
 dvd_MinimumTitleLength = "@@MIN_TITLE_SECONDS@@"
+
+# ---------- UHD / LibreDrive ----------
+# Enable LibreDrive mode for 4K UHD Blu-ray ripping.
+# LibreDrive bypasses the firmware of the optical drive to read the
+# raw disc data directly — required for AACS 2.0 (UHD) decryption.
+# Requires a compatible drive (typically a Pioneer, LG, or ASUS model
+# with "friendly" firmware).
+app_LibreDrive = "1"
 
 # Expert mode settings for audio handling
 # Ensure AC3/DTS and other audio codecs are preserved in the MKV container

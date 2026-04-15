@@ -9,6 +9,7 @@
 # Job types:
 #   video (default) — Transcode MPEG-2 → H.265 using NVIDIA NVENC on the
 #                     GPU node, then rename/move into Jellyfin-compatible paths.
+#                     UHD Blu-ray jobs skip transcoding (already H.265 + HDR).
 #   audio-cd        — Tag, rename, and move audio files from staging into the
 #                     Music library (Artist/Album/NN - Title.ext).
 #
@@ -53,6 +54,7 @@ MNAMER_MOVIE_DIR="$OUTPUT_BASE/Video/Movies"
 MNAMER_MOVIE_FORMAT="${MNAMER_MOVIE_FORMAT:-{name} ({year})/{name} ({year}){extension}}"
 
 EPISODES_PER_DISC="${EPISODES_PER_DISC:-4}"
+UHD_KEEP_ORIGINAL="${UHD_KEEP_ORIGINAL:-yes}"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $LOGPREFIX $*"; }
 
@@ -496,13 +498,14 @@ process_job() {
     update_worker_status "transcoding" "$job_file" "Reading job..."
 
     # Parse job JSON (minimal — use grep/sed, no jq dependency)
-    local disc_title file_path disc_type source_host title_index title_count
+    local disc_title file_path disc_type source_host title_index title_count is_uhd
     disc_title=$(grep -oP '"disc_title"\s*:\s*"\K[^"]+' "$job_file" || echo "")
     file_path=$(grep -oP '"file_path"\s*:\s*"\K[^"]+' "$job_file" || echo "")
     disc_type=$(grep -oP '"disc_type"\s*:\s*"\K[^"]+' "$job_file" || echo "DVD")
     source_host=$(grep -oP '"source_host"\s*:\s*"\K[^"]+' "$job_file" || echo "unknown")
     title_index=$(grep -oP '"title_index"\s*:\s*\K[0-9]+' "$job_file" || echo "0")
     title_count=$(grep -oP '"title_count"\s*:\s*\K[0-9]+' "$job_file" || echo "0")
+    is_uhd=$(grep -oP '"is_uhd"\s*:\s*\K(true|false)' "$job_file" || echo "false")
 
     if [ -z "$disc_title" ] || [ -z "$file_path" ]; then
         log "ERROR: Invalid job file $job_name (missing disc_title or file_path)"
@@ -533,31 +536,39 @@ process_job() {
 
     update_worker_status "transcoding" "$processing_file" "[$title_index/$title_count] $basename_mkv"
 
-    # Check if needs transcoding
-    local video_codec
-    video_codec=$(ffprobe -loglevel error -select_streams v:0 \
-        -show_entries stream=codec_name -of csv=p=0 "$file_path" 2>/dev/null | tr -d ',' | tr -d ' ' || true)
-
-    if [ "$video_codec" = "mpeg2video" ]; then
-        log "Transcoding $basename_mkv (MPEG-2 → H.265)..."
-        local transcode_tmp="${file_path%.mkv}.transcoding.mkv"
-        if ffmpeg -i "$file_path" \
-            -map 0 \
-            $ffmpeg_video_opts \
-            -c:a copy \
-            -c:s copy \
-            -movflags +faststart \
-            -y "$transcode_tmp" 2>&1; then
-            mv -f "$transcode_tmp" "$file_path"
-            log "Transcoded $basename_mkv successfully"
-        else
-            log "WARNING: Failed to transcode $basename_mkv"
-            rm -f "$transcode_tmp"
-            mv "$processing_file" "${processing_file%.processing}.error"
-            return 1
-        fi
+    # ---------- UHD Blu-ray: skip transcode ----------
+    # 4K UHD content is already H.265/HEVC with HDR metadata.  Re-encoding
+    # would destroy HDR10/Dolby Vision data and take an extremely long time
+    # at 4K resolution.  Keep the original MakeMKV output as-is.
+    if [ "$is_uhd" = "true" ] && [ "$UHD_KEEP_ORIGINAL" = "yes" ]; then
+        log "$basename_mkv is 4K UHD — skipping transcode (UHD_KEEP_ORIGINAL=yes)"
     else
-        log "$basename_mkv already $video_codec, skipping transcode"
+        # Check if needs transcoding
+        local video_codec
+        video_codec=$(ffprobe -loglevel error -select_streams v:0 \
+            -show_entries stream=codec_name -of csv=p=0 "$file_path" 2>/dev/null | tr -d ',' | tr -d ' ' || true)
+
+        if [ "$video_codec" = "mpeg2video" ]; then
+            log "Transcoding $basename_mkv (MPEG-2 → H.265)..."
+            local transcode_tmp="${file_path%.mkv}.transcoding.mkv"
+            if ffmpeg -i "$file_path" \
+                -map 0 \
+                $ffmpeg_video_opts \
+                -c:a copy \
+                -c:s copy \
+                -movflags +faststart \
+                -y "$transcode_tmp" 2>&1; then
+                mv -f "$transcode_tmp" "$file_path"
+                log "Transcoded $basename_mkv successfully"
+            else
+                log "WARNING: Failed to transcode $basename_mkv"
+                rm -f "$transcode_tmp"
+                mv "$processing_file" "${processing_file%.processing}.error"
+                return 1
+            fi
+        else
+            log "$basename_mkv already $video_codec, skipping transcode"
+        fi
     fi
 
     # Rename/move file to final location

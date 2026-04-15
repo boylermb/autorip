@@ -6,6 +6,7 @@
 # Usage: autorip.sh /dev/sr0
 #
 # Detects the disc type and rips accordingly:
+#   - 4K UHD Blu-ray → MakeMKV (LibreDrive) → enqueue (no transcode) → rename
 #   - Blu-ray / DVD  → MakeMKV → transcode/enqueue → rename
 #   - Audio CD        → abcde  → $OUTPUT_BASE/Audio/Music/
 #
@@ -54,6 +55,7 @@ MNAMER_MOVIE_FORMAT="${MNAMER_MOVIE_FORMAT:-{name} ({year})/{name} ({year}){exte
 # Config defaults
 MIN_TITLE_SECONDS="${MIN_TITLE_SECONDS:-120}"
 EPISODES_PER_DISC="${EPISODES_PER_DISC:-4}"
+UHD_KEEP_ORIGINAL="${UHD_KEEP_ORIGINAL:-yes}"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $LOGPREFIX $*"; }
 
@@ -484,6 +486,7 @@ enqueue_transcode() {
     local disc_type="$3"
     local title_index="$4"
     local title_count="$5"
+    local is_uhd="${6:-false}"
 
     mkdir -p "$QUEUE_DIR"
     local job_file="$QUEUE_DIR/${HOSTNAME}_${disc_title}_t$(printf '%02d' "$title_index")_$(date +%s).json"
@@ -495,6 +498,7 @@ enqueue_transcode() {
     "disc_title": "$(printf '%s' "$disc_title" | sed 's/\\/\\\\/g; s/"/\\"/g')",
     "file_path": "$file_path",
     "disc_type": "$disc_type",
+    "is_uhd": $is_uhd,
     "title_index": $title_index,
     "title_count": $title_count,
     "source_host": "$HOSTNAME",
@@ -615,7 +619,10 @@ is_audio_cd=false
 
 if echo "$disc_info" | grep -q "ID_CDROM_MEDIA_BD=1"; then
     is_bluray=true
-    log "Detected: Blu-ray disc"
+    # UHD Blu-rays also report ID_CDROM_MEDIA_BD=1.  We distinguish them
+    # later using MakeMKV's disc info (AACS v2 / 4K resolution) once we
+    # have the disc title scan results.
+    log "Detected: Blu-ray disc (checking for UHD...)"
     update_status "ripping" "Blu-ray" "" "Detecting..."
 elif echo "$disc_info" | grep -q "ID_CDROM_MEDIA_DVD=1"; then
     is_dvd=true
@@ -643,10 +650,31 @@ rip_video_disc() {
 
     log "Starting $disc_type rip..."
 
-    DISC_TITLE=$(makemkvcon -r info dev:"$DEVICE" 2>/dev/null | grep "^DRV:0" | cut -d',' -f6 | tr -d '"' | tr ' ' '_' || echo "")
+    # Grab full MakeMKV info output — used for disc title and UHD detection
+    MAKEMKV_INFO=$(makemkvcon -r info dev:"$DEVICE" 2>/dev/null || true)
+
+    DISC_TITLE=$(echo "$MAKEMKV_INFO" | grep "^DRV:0" | cut -d',' -f6 | tr -d '"' | tr ' ' '_' || echo "")
     if [ -z "$DISC_TITLE" ]; then
         DISC_TITLE="$fallback_title"
         log "WARNING: Could not determine disc title, using $DISC_TITLE"
+    fi
+
+    # ---------- UHD Blu-ray detection ----------
+    # MakeMKV reports "AACS2" or "BDMV 4K" for UHD discs.  Check the info
+    # output for indicators:
+    #   - CINFO with "Ultra HD" or "UHD" in the disc label
+    #   - AACS v2 (AACS 2.0) encryption markers
+    #   - 3840x2160 resolution in title info
+    local is_uhd=false
+    if [ "$disc_type" = "Blu-ray" ]; then
+        if echo "$MAKEMKV_INFO" | grep -qiE 'Ultra.?HD|UHD|AACS2|AACS v2|3840x2160'; then
+            is_uhd=true
+            disc_type="UHD Blu-ray"
+            log "Detected: 4K UHD Blu-ray (AACS v2 / LibreDrive)"
+            update_status "ripping" "UHD Blu-ray" "$DISC_TITLE" "Scanning titles..." "" "$DISC_TITLE" "[]"
+        else
+            log "Detected: Standard Blu-ray"
+        fi
     fi
 
     log "Scanning disc for titles (minlength=${MIN_TITLE_SECONDS}s)..."
@@ -695,7 +723,7 @@ rip_video_disc() {
                 fi
 
                 log "Title $tid ripped: $(basename "$mkv_file") — enqueueing for transcode"
-                enqueue_transcode "$DISC_TITLE" "$mkv_file" "$disc_type" "$CURRENT" "$TITLE_COUNT"
+                enqueue_transcode "$DISC_TITLE" "$mkv_file" "$disc_type" "$CURRENT" "$TITLE_COUNT" "$is_uhd"
                 touch "$LOCKFILE"
             else
                 log "WARNING: Could not find MKV file for title $tid"
