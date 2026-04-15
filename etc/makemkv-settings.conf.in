@@ -27,6 +27,12 @@ dvd_MinimumTitleLength = "@@MIN_TITLE_SECONDS@@"
 # with "friendly" firmware).
 app_LibreDrive = "1"
 
+# ---------- Registration ----------
+# MakeMKV beta key (free while in beta).  Required for Blu-ray and UHD
+# decryption.  Check https://forum.makemkv.com/forum/viewtopic.php?t=1053
+# for updated keys — the current key expires end of May 2026.
+app_Key = "T-sJ5R5BKxhD671U9s0teXbyP19MhCkkkB7rmnNbb1aEHaqveiVqyI3RXGMHDXhoyNUC"
+
 # Expert mode settings for audio handling
 # Ensure AC3/DTS and other audio codecs are preserved in the MKV container
 app_UpdateEnable = "0"
