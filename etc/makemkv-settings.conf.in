@@ -33,6 +33,7 @@ app_LibreDrive = "1"
 # for updated keys — the current key expires end of May 2026.
 app_Key = "T-sJ5R5BKxhD671U9s0teXbyP19MhCkkkB7rmnNbb1aEHaqveiVqyI3RXGMHDXhoyNUC"
 
-# Expert mode settings for audio handling
-# Ensure AC3/DTS and other audio codecs are preserved in the MKV container
-app_UpdateEnable = "0"
+# Allow MakeMKV to contact its web server to download the latest
+# hashed keys for UHD disc decryption.  Without this, discs with
+# unknown volume keys will fail to open.
+app_UpdateEnable = "1"
