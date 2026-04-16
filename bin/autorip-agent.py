@@ -143,7 +143,30 @@ def read_transcode_queue():
 
 
 def read_status():
-    """Read the local autorip status JSON."""
+    """Read the local autorip status JSON.
+
+    Checks for per-device status files (status-sr0.json, status-sr1.json, …)
+    first, falling back to the legacy single status.json.
+    """
+    per_device = {}
+    for path in sorted(glob.glob(os.path.join(STATUS_DIR, "status-sr*.json"))):
+        dev = os.path.basename(path).replace("status-", "").replace(".json", "")
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            data["online"] = True
+            data["hostname"] = HOSTNAME
+            data["device"] = dev
+            art_path = os.path.join(ART_DIR, "cover.jpg")
+            data["has_art"] = os.path.exists(art_path)
+            per_device[dev] = data
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+    if per_device:
+        return per_device
+
+    # Legacy fallback: single status.json
     status_file = os.path.join(STATUS_DIR, "status.json")
     try:
         with open(status_file, "r") as f:
@@ -152,24 +175,27 @@ def read_status():
         data["hostname"] = HOSTNAME
         art_path = os.path.join(ART_DIR, "cover.jpg")
         data["has_art"] = os.path.exists(art_path)
-        return data
+        dev = data.get("device", "sr0") or "sr0"
+        return {dev: data}
     except (FileNotFoundError, json.JSONDecodeError):
         return {
-            "hostname": HOSTNAME,
-            "online": True,
-            "status": "idle",
-            "device": "",
-            "disc_type": "",
-            "title": "",
-            "progress": "",
-            "artist": "",
-            "album": "",
-            "tracks": [],
-            "tracks_total": 0,
-            "tracks_completed": 0,
-            "current_track": "",
-            "has_art": False,
-            "updated": "",
+            "sr0": {
+                "hostname": HOSTNAME,
+                "online": True,
+                "status": "idle",
+                "device": "sr0",
+                "disc_type": "",
+                "title": "",
+                "progress": "",
+                "artist": "",
+                "album": "",
+                "tracks": [],
+                "tracks_total": 0,
+                "tracks_completed": 0,
+                "current_track": "",
+                "has_art": False,
+                "updated": "",
+            }
         }
 
 
@@ -285,12 +311,47 @@ def get_optical_drives():
 
 @app.route("/status")
 def status():
-    data = read_status()
-    data["drives"] = get_optical_drives()
-    # Attach live progress parsed from the log file
-    device = data.get("device") or "sr0"
-    data["progress_info"] = parse_progress(device)
-    return jsonify(data)
+    per_device = read_status()
+    drives = get_optical_drives()
+    drive_map = {d["device"]: d for d in drives}
+
+    results = []
+    # Emit one entry per known drive
+    seen = set()
+    for dev, data in per_device.items():
+        data["drives"] = drives
+        data["progress_info"] = parse_progress(dev)
+        # Merge drive hardware info
+        if dev in drive_map:
+            data["has_disc"] = drive_map[dev].get("has_disc", False)
+        results.append(data)
+        seen.add(dev)
+
+    # Add entries for any drives that have no status file (idle drives)
+    for drv in drives:
+        if drv["device"] not in seen:
+            results.append({
+                "hostname": HOSTNAME,
+                "online": True,
+                "status": "idle",
+                "device": drv["device"],
+                "disc_type": "",
+                "title": "",
+                "progress": "",
+                "artist": "",
+                "album": "",
+                "tracks": [],
+                "tracks_total": 0,
+                "tracks_completed": 0,
+                "current_track": "",
+                "has_art": False,
+                "has_disc": drv.get("has_disc", False),
+                "updated": "",
+                "drives": drives,
+                "progress_info": {"total_percent": -1, "current_percent": -1, "stage": "idle", "current_action": ""},
+            })
+
+    return jsonify(results)
 
 
 @app.route("/log")

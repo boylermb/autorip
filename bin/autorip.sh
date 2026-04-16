@@ -87,6 +87,8 @@ update_status() {
     s_disc_type=$(json_escape "$disc_type")
     s_progress=$(json_escape "$progress")
     s_current_track=$(json_escape "$current_track")
+    local dev_name
+    dev_name=$(basename "$DEVICE")
     local tmpfile
     tmpfile=$(mktemp "$STATUS_DIR/.status.json.XXXXXX")
     chmod 644 "$tmpfile"
@@ -94,7 +96,7 @@ update_status() {
 {
     "hostname": "${HOSTNAME}",
     "status": "${status}",
-    "device": "$(basename "$DEVICE")",
+    "device": "${dev_name}",
     "disc_type": "${s_disc_type}",
     "title": "${s_title}",
     "progress": "${s_progress}",
@@ -108,7 +110,10 @@ update_status() {
     "updated": "$(date '+%Y-%m-%d %H:%M:%S')"
 }
 EOF
-    mv -f "$tmpfile" "$STATUS_DIR/status.json"
+    # Per-device status file so multi-drive machines show independent cards
+    mv -f "$tmpfile" "$STATUS_DIR/status-${dev_name}.json"
+    # Backward compat: also update the legacy single-file status
+    cp -f "$STATUS_DIR/status-${dev_name}.json" "$STATUS_DIR/status.json"
 }
 
 # ---------- Library duplicate check ----------
