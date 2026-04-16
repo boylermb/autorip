@@ -12,6 +12,8 @@ Provides:
     GET  /transcode-queue — Shared GPU transcode queue state
     GET  /review/jobs     — List all items pending review (from .unreviewed/ dir)
     POST /review/edit     — Edit metadata of an unreviewed item
+    POST /review/rename   — Rename a media file within an unreviewed item
+    GET  /review/stream   — Stream a media file for playback
     POST /review/approve  — Approve a single unreviewed item (moves to library)
     POST /review/reject   — Reject a single unreviewed item (deletes)
     GET  /health          — Health check
@@ -550,7 +552,7 @@ def review_edit():
         return jsonify({"error": "Invalid item_path"}), 400
 
     # Only allow editing safe metadata fields
-    EDITABLE_FIELDS = {"artist", "album", "tracks", "disc_title"}
+    EDITABLE_FIELDS = {"artist", "album", "tracks", "disc_title", "source_type"}
     unknown = set(fields.keys()) - EDITABLE_FIELDS
     if unknown:
         return jsonify({"error": f"Cannot edit fields: {', '.join(unknown)}"}), 400
@@ -586,6 +588,84 @@ def review_edit():
 
     return jsonify({"ok": True, "message": f"Updated {', '.join(fields.keys())}",
                     "job": data})
+
+
+@app.route("/review/rename", methods=["POST"])
+def review_rename():
+    """Rename a media file within an unreviewed item.
+
+    Accepts JSON: { "item_path": "Video/TV/...", "old_name": "title00.mkv", "new_name": "S01E01.mkv" }
+    Only renames within the same directory. Preserves file extension.
+    """
+    if not request.is_json:
+        return jsonify({"error": "JSON body required"}), 400
+    item_path = request.json.get("item_path", "").strip()
+    old_name = request.json.get("old_name", "").strip()
+    new_name = request.json.get("new_name", "").strip()
+
+    if not item_path or not old_name or not new_name:
+        return jsonify({"error": "Missing item_path, old_name, or new_name"}), 400
+
+    # Prevent path traversal
+    safe = os.path.normpath(item_path)
+    if safe.startswith("..") or safe.startswith("/"):
+        return jsonify({"error": "Invalid item_path"}), 400
+    if "/" in old_name or "/" in new_name or ".." in new_name:
+        return jsonify({"error": "Invalid filename"}), 400
+    if new_name == "metadata.json":
+        return jsonify({"error": "Cannot use reserved name"}), 400
+
+    item_dir = os.path.join(UNREVIEWED_DIR, safe)
+    old_path = os.path.join(item_dir, old_name)
+    new_path = os.path.join(item_dir, new_name)
+
+    if not os.path.isfile(old_path):
+        return jsonify({"error": f"File not found: {old_name}"}), 404
+    if os.path.exists(new_path):
+        return jsonify({"error": f"File already exists: {new_name}"}), 409
+
+    try:
+        os.rename(old_path, new_path)
+    except OSError as exc:
+        return jsonify({"error": f"Rename failed: {exc}"}), 500
+
+    return jsonify({"ok": True, "message": f"Renamed {old_name} → {new_name}"})
+
+
+@app.route("/review/stream")
+def review_stream():
+    """Stream a media file from an unreviewed item for playback.
+
+    Query params: ?item_path=Video/TV/...&file=episode.mkv
+    Supports HTTP Range requests for seeking.
+    """
+    item_path = request.args.get("item_path", "").strip()
+    filename = request.args.get("file", "").strip()
+    if not item_path or not filename:
+        return jsonify({"error": "Missing item_path or file param"}), 400
+
+    safe = os.path.normpath(item_path)
+    if safe.startswith("..") or safe.startswith("/"):
+        abort(400)
+    if "/" in filename or ".." in filename:
+        abort(400)
+
+    fpath = os.path.join(UNREVIEWED_DIR, safe, filename)
+    if not os.path.isfile(fpath):
+        abort(404)
+
+    # Determine mimetype
+    ext = os.path.splitext(filename)[1].lower()
+    mimetypes = {
+        ".mkv": "video/x-matroska", ".mp4": "video/mp4",
+        ".avi": "video/x-msvideo", ".m4v": "video/mp4",
+        ".flac": "audio/flac", ".mp3": "audio/mpeg",
+        ".ogg": "audio/ogg", ".wav": "audio/wav",
+        ".m4a": "audio/mp4", ".opus": "audio/opus",
+    }
+    mimetype = mimetypes.get(ext, "application/octet-stream")
+
+    return send_file(fpath, mimetype=mimetype, conditional=True)
 
 
 @app.route("/review/lookup", methods=["POST"])
