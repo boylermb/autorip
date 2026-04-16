@@ -659,7 +659,7 @@ elif echo "$disc_info" | grep -q "ID_CDROM_MEDIA_CD=1"; then
         update_status "ripping" "Audio CD" "" "Detecting..."
     else
         log "Detected: Data CD - skipping (not a media disc)"
-        # eject "$DEVICE" 2>/dev/null || true
+        eject "$DEVICE" 2>/dev/null || true
         exit 0
     fi
 else
@@ -725,7 +725,7 @@ rip_video_disc() {
     if [ "$TITLE_COUNT" -eq 0 ]; then
         log "ERROR: No titles found on $disc_type disc"
         update_status "error" "$disc_type" "$DISC_TITLE" "No titles found" "" "$DISC_TITLE" "[]"
-        # eject "$DEVICE" 2>/dev/null || true
+        eject "$DEVICE" 2>/dev/null || true
         exit 1
     fi
 
@@ -824,7 +824,7 @@ if $is_audio_cd; then
             update_status "complete" "Audio CD" "$CD_ALBUM" "Already in library — skipped" "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON"
             log "Ejecting disc (duplicate)..."
             sleep 2
-            # eject "$DEVICE" 2>/dev/null || true
+            eject "$DEVICE" 2>/dev/null || true
             date +%s > "$COOLDOWN_FILE"
             update_status "idle"
             log "Done (skipped duplicate)."
@@ -944,7 +944,7 @@ fi
 # ---------- Eject disc when done ----------
 log "Ejecting disc..."
 sleep 2
-# eject "$DEVICE" 2>/dev/null || true
+eject "$DEVICE" 2>/dev/null || true
 date +%s > "$COOLDOWN_FILE"
 update_status "idle"
 log "Done."
