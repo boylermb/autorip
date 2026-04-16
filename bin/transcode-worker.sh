@@ -16,13 +16,20 @@
 # Jobs arrive as titles/discs are ripped, so processing can begin while the
 # disc is still being read.
 #
-# Staging files are preserved after processing for review. Use the `list`
-# and `clean` subcommands to inspect and purge them.
+# After processing, files are moved to $OUTPUT_BASE/.unreviewed/ (mirroring
+# the Media directory structure) along with a metadata.json file.  Staging
+# files are deleted immediately after transcoding to free disk space.
+#
+# Use the separate media-review web app (or the `approve`/`reject`
+# subcommands) to review items before they are moved into the official
+# Media library.
 #
 # Usage:
 #   transcode-worker.sh          Process pending queue jobs (systemd timer)
-#   transcode-worker.sh list     Show jobs pending review
-#   transcode-worker.sh clean    Purge reviewed staging dirs
+#   transcode-worker.sh list     Show items pending review
+#   transcode-worker.sh clean    Approve all and move to library
+#   transcode-worker.sh approve <path>  Approve a single item
+#   transcode-worker.sh reject <path>   Reject a single item
 #
 # Runs as a systemd oneshot triggered by a 30s timer.
 # =============================================================================
@@ -44,13 +51,17 @@ STAGING_DIR="$OUTPUT_BASE/.autorip-staging"
 MOVIES_DIR="$OUTPUT_BASE/Video/Movies"
 TV_DIR="$OUTPUT_BASE/Video/TV"
 MUSIC_DIR="$OUTPUT_BASE/Audio/Music"
+UNREVIEWED_DIR="$OUTPUT_BASE/.unreviewed"
+UNREVIEWED_MOVIES="$UNREVIEWED_DIR/Video/Movies"
+UNREVIEWED_TV="$UNREVIEWED_DIR/Video/TV"
+UNREVIEWED_MUSIC="$UNREVIEWED_DIR/Audio/Music"
 RIP_LOG="$OUTPUT_BASE/.rip-log.json"
 RIP_LOG_MD="$OUTPUT_BASE/.rip-log.md"
 STATUS_FILE="$OUTPUT_BASE/.autorip-queue/.worker-status.json"
 HOSTNAME=$(hostname)
 
-# mnamer settings (movies only)
-MNAMER_MOVIE_DIR="$OUTPUT_BASE/Video/Movies"
+# mnamer settings (movies only) — target unreviewed dir, not final Media dir
+MNAMER_MOVIE_DIR="$UNREVIEWED_DIR/Video/Movies"
 MNAMER_MOVIE_FORMAT="${MNAMER_MOVIE_FORMAT:-{name} ({year})/{name} ({year}){extension}}"
 
 EPISODES_PER_DISC="${EPISODES_PER_DISC:-4}"
@@ -282,15 +293,15 @@ tv_rename_file() {
     local title_index="$2"   # 1-indexed
     local season_dir
     season_dir=$(printf "Season %02d" "$TV_SEASON")
-    local dest_dir="$TV_DIR/$TV_SHOW/$season_dir"
+    local dest_dir="$UNREVIEWED_TV/$TV_SHOW/$season_dir"
     mkdir -p "$dest_dir"
 
     # Episode number: (disc - 1) * episodes_per_disc + title_index
     local ep_num=$(( (TV_DISC - 1) * EPISODES_PER_DISC + title_index ))
     local ep_name
     ep_name=$(printf "%s - S%02dE%02d.mkv" "$TV_SHOW" "$TV_SEASON" "$ep_num")
-    cp -f "$mkv" "$dest_dir/$ep_name"
-    log "Copied $(basename "$mkv") → $ep_name (staging kept for review)"
+    mv -f "$mkv" "$dest_dir/$ep_name"
+    log "Moved $(basename "$mkv") → $dest_dir/$ep_name"
 }
 
 # ---------- Movie rename (single file, mnamer) ----------
@@ -304,9 +315,9 @@ movie_rename_file() {
         return
     fi
 
-    # Copy to a temp file so mnamer can move it while we keep the staging original
+    # Move to a temp file so mnamer can move it into the unreviewed dir
     local tmp_copy="${mkv%.mkv}.mnamer-copy.mkv"
-    cp -f "$mkv" "$tmp_copy"
+    mv -f "$mkv" "$tmp_copy"
 
     log "Running mnamer for movie file: $(basename "$mkv")"
     if mnamer --batch \
@@ -317,14 +328,14 @@ movie_rename_file() {
         "$tmp_copy" 2>&1; then
         if [ -f "$tmp_copy" ]; then
             log "mnamer did not match $(basename "$mkv"), using fallback"
-            rm -f "$tmp_copy"
+            mv -f "$tmp_copy" "$mkv"
             movie_fallback_file "$mkv" "$disc_title"
         else
-            log "mnamer matched and moved $(basename "$mkv") (staging kept for review)"
+            log "mnamer matched and moved $(basename "$mkv") to unreviewed"
         fi
     else
         log "mnamer failed, using fallback"
-        rm -f "$tmp_copy"
+        [ -f "$tmp_copy" ] && mv -f "$tmp_copy" "$mkv"
         movie_fallback_file "$mkv" "$disc_title"
     fi
 }
@@ -332,10 +343,10 @@ movie_rename_file() {
 movie_fallback_file() {
     local mkv="$1"
     local disc_title="$2"
-    local fallback_dir="$MOVIES_DIR/$disc_title"
+    local fallback_dir="$UNREVIEWED_MOVIES/$disc_title"
     mkdir -p "$fallback_dir"
-    cp -f "$mkv" "$fallback_dir/"
-    log "Copied $(basename "$mkv") to $fallback_dir (staging kept for review)"
+    mv -f "$mkv" "$fallback_dir/"
+    log "Moved $(basename "$mkv") to $fallback_dir"
 }
 
 # ---------- Process audio CD post-processing job ----------
@@ -376,15 +387,15 @@ print(json.dumps(job.get('tracks', [])))
     log "Post-processing: $artist / $album ($format from $source_host)"
     update_worker_status "post-processing" "$processing_file" "$artist — $album"
 
-    # Build final destination: Music/Artist/Album/
+    # Build final destination: unreviewed Music/Artist/Album/
     local safe_artist safe_album
     safe_artist=$(echo "$artist" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
     safe_album=$(echo "$album" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
-    local final_dir="$MUSIC_DIR/$safe_artist/$safe_album"
+    local final_dir="$UNREVIEWED_MUSIC/$safe_artist/$safe_album"
     mkdir -p "$final_dir"
     # Ensure the artist directory is also accessible
-    chown autorip:autorip "$MUSIC_DIR/$safe_artist" 2>/dev/null || true
-    chmod 777 "$MUSIC_DIR/$safe_artist" 2>/dev/null || true
+    chown autorip:autorip "$UNREVIEWED_MUSIC/$safe_artist" 2>/dev/null || true
+    chmod 777 "$UNREVIEWED_MUSIC/$safe_artist" 2>/dev/null || true
 
     # Get track names as a bash array
     local -a track_names
@@ -468,25 +479,35 @@ for t in tracks:
     chmod 777 "$final_dir" 2>/dev/null || true
     chmod 666 "$final_dir"/* 2>/dev/null || true
 
-    # Rip log entry is deferred until review is approved (clean subcommand).
+    # Rip log entry is deferred until review is approved.
 
-    # Keep staging directory for review — files are copied, not moved.
-    # Run `transcode-worker.sh clean` to purge reviewed staging dirs.
-    log "Staging kept for review: $staging_dir"
-
-    # Record original library destination so approve can clean it up if metadata is edited
+    # Write metadata.json for the review app
     python3 -c "
-import json, sys
+import json, sys, datetime
 with open(sys.argv[1], 'r') as f:
     data = json.load(f)
-data['_original_dest'] = sys.argv[2]
-with open(sys.argv[1], 'w') as f:
+data['_unreviewed_dir'] = sys.argv[2]
+data['_processed_at'] = datetime.datetime.now().isoformat()
+with open(sys.argv[2] + '/metadata.json', 'w') as f:
     json.dump(data, f, indent=2)
 " "$processing_file" "$final_dir" 2>/dev/null || true
 
-    # Mark job as needing review (staging still present)
-    mv "$processing_file" "${processing_file%.processing}.review"
-    log "Audio CD job complete (pending review): $artist / $album ($file_num tracks)"
+    # Clean staging — files have been moved to the unreviewed dir
+    if [ -n "$staging_dir" ] && [ -d "$staging_dir" ]; then
+        local dir_size
+        dir_size=$(du -sh "$staging_dir" 2>/dev/null | cut -f1)
+        log "Cleaning staging: $staging_dir ($dir_size)"
+        rm -rf "$staging_dir"
+        local parent_dir
+        parent_dir=$(dirname "$staging_dir")
+        if [ -d "$parent_dir" ] && [ "$(basename "$parent_dir")" != ".autorip-staging" ]; then
+            rmdir "$parent_dir" 2>/dev/null || true
+        fi
+    fi
+
+    # Remove the processing file — unreviewed dir metadata.json is now the record
+    rm -f "$processing_file"
+    log "Audio CD job complete (pending review in unreviewed): $artist / $album ($file_num tracks)"
 }
 
 # ---------- Transcode a single MKV file ----------
@@ -670,347 +691,37 @@ process_job() {
         fi
     done
 
-    # Keep staging directory for review — files are copied, not moved.
-    log "Staging kept for review: $staging_dir"
-
-    # Mark job as needing review (staging still present)
-    mv "$processing_file" "${processing_file%.processing}.review"
-    log "Job complete (pending review): $disc_title ($total_files title(s))"
-}
-
-# ==========================================================================
-# Subcommands
-# ==========================================================================
-
-# ---------- clean: purge reviewed staging dirs and .review job files ----------
-clean_reviewed() {
-    local review_count=0
-    local bytes_freed=0
-
-    for review_file in "$QUEUE_DIR"/*.review; do
-        [ -f "$review_file" ] || continue
-        review_count=$((review_count + 1))
-
-        # Try to find the staging dir from the job
-        local staging_dir=""
-        staging_dir=$(grep -oP '"staging_dir"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-        if [ -z "$staging_dir" ]; then
-            # Video jobs store file_path; staging dir is the parent
-            local file_path
-            file_path=$(grep -oP '"file_path"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-            if [ -n "$file_path" ]; then
-                staging_dir=$(dirname "$file_path")
-            fi
-        fi
-
-        local job_desc
-        job_desc=$(basename "$review_file")
-
-        if [ -n "$staging_dir" ] && [ -d "$staging_dir" ]; then
-            local dir_size
-            dir_size=$(du -sh "$staging_dir" 2>/dev/null | cut -f1)
-            log "Cleaning: $job_desc → $staging_dir ($dir_size)"
-            rm -rf "$staging_dir"
-            # Clean up empty parent (e.g. .autorip-staging/Artist/ or .autorip-staging/DISC_TITLE/)
-            local parent_dir
-            parent_dir=$(dirname "$staging_dir")
-            if [ -d "$parent_dir" ] && [ "$(basename "$parent_dir")" != ".autorip-staging" ]; then
-                rmdir "$parent_dir" 2>/dev/null || true
-            fi
-        else
-            log "Cleaning: $job_desc (no staging dir to remove)"
-        fi
-
-        # Record in rip history now that review is approved
-        local job_type="" artist="" album="" format="" tracks_json=""
-        job_type=$(grep -oP '"job_type"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || echo "video")
-        artist=$(grep -oP '"artist"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-        album=$(grep -oP '"album"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-        format=$(grep -oP '"format"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || echo "mp3")
-
-        if [ "$job_type" = "audio-cd" ] && [ -n "$artist" ] && [ -n "$album" ]; then
-            # Extract tracks JSON array using python3
-            tracks_json=$(python3 -c "
-import json, sys
-with open(sys.argv[1]) as f:
-    job = json.load(f)
-print(json.dumps(job.get('tracks', [])))
-" "$review_file" 2>/dev/null || echo "[]")
-
-            local safe_artist safe_album cover_rel=""
-            safe_artist=$(echo "$artist" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
-            safe_album=$(echo "$album" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
-            if [ -f "$MUSIC_DIR/$safe_artist/$safe_album/cover.jpg" ]; then
-                cover_rel="Audio/Music/$safe_artist/$safe_album/cover.jpg"
-            fi
-            log_rip_entry "Audio CD" "$artist" "$album" "$tracks_json" "$cover_rel"
-        fi
-
-        rm -f "$review_file"
-    done
-
-    if [ "$review_count" -eq 0 ]; then
-        log "No reviewed jobs to clean up."
+    # Determine the unreviewed output directory for metadata.json
+    local unreviewed_dest=""
+    if parse_tv_disc_title "$disc_title"; then
+        local season_dir
+        season_dir=$(printf "Season %02d" "$TV_SEASON")
+        unreviewed_dest="$UNREVIEWED_TV/$TV_SHOW/$season_dir"
     else
-        log "Cleaned $review_count reviewed job(s)."
-    fi
-}
-
-# ---------- list: show pending review jobs ----------
-list_reviewed() {
-    local count=0
-    for review_file in "$QUEUE_DIR"/*.review; do
-        [ -f "$review_file" ] || continue
-        count=$((count + 1))
-
-        local staging_dir="" file_path="" disc_title="" artist="" album="" job_type=""
-        job_type=$(grep -oP '"job_type"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || echo "video")
-        disc_title=$(grep -oP '"disc_title"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-        artist=$(grep -oP '"artist"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-        album=$(grep -oP '"album"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-        staging_dir=$(grep -oP '"staging_dir"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-        if [ -z "$staging_dir" ]; then
-            file_path=$(grep -oP '"file_path"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-            staging_dir=$(dirname "$file_path" 2>/dev/null || echo "?")
-        fi
-
-        local dir_status="MISSING"
-        local dir_size=""
-        if [ -d "$staging_dir" ]; then
-            dir_status="OK"
-            dir_size=" ($(du -sh "$staging_dir" 2>/dev/null | cut -f1))"
-        fi
-
-        if [ "$job_type" = "audio-cd" ]; then
-            echo "  [$count] Audio CD: $artist / $album"
-        else
-            # Count files in multi-file disc jobs
-            local file_count
-            file_count=$(grep -c '"file_path"' "$review_file" 2>/dev/null || echo "1")
-            echo "  [$count] Video: $disc_title ($file_count title(s))"
-        fi
-        echo "       Staging: $staging_dir [$dir_status]$dir_size"
-        echo "       Job: $(basename "$review_file")"
-    done
-
-    if [ "$count" -eq 0 ]; then
-        echo "No jobs pending review."
-    else
-        echo ""
-        echo "$count job(s) pending review. Run '$0 clean' to purge staging files."
-    fi
-}
-
-# ---------- approve: approve a single reviewed job ----------
-approve_single() {
-    local job_id="$1"
-    local review_file=""
-
-    # Find the .review file matching job_id (match by prefix or full name)
-    for f in "$QUEUE_DIR"/*.review; do
-        [ -f "$f" ] || continue
-        local base
-        base=$(basename "$f")
-        if [ "$base" = "$job_id" ] || [ "$base" = "${job_id}.review" ] || [ "${base%.review}" = "$job_id" ]; then
-            review_file="$f"
-            break
-        fi
-    done
-
-    if [ -z "$review_file" ]; then
-        echo "ERROR: No review job found matching: $job_id" >&2
-        exit 1
+        # For movies, find where mnamer/fallback placed files
+        # Use the last file's parent directory
+        for fp_check in "${file_paths[@]}"; do
+            # Files were moved by rename functions; scan unreviewed movies for recent entries
+            true
+        done
+        # Fallback: use disc_title as the folder
+        unreviewed_dest="$UNREVIEWED_MOVIES/$disc_title"
     fi
 
-    log "Approving single job: $(basename "$review_file")"
-
-    # Extract job info
-    local job_type="" artist="" album="" staging_dir="" file_path="" format=""
-    job_type=$(grep -oP '"job_type"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || echo "video")
-    artist=$(grep -oP '"artist"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-    album=$(grep -oP '"album"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-    staging_dir=$(grep -oP '"staging_dir"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-    format=$(grep -oP '"format"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || echo "mp3")
-
-    if [ -z "$staging_dir" ]; then
-        file_path=$(grep -oP '"file_path"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-        staging_dir=$(dirname "$file_path" 2>/dev/null || echo "")
+    # Write metadata.json for the review app
+    if [ -n "$unreviewed_dest" ] && [ -d "$unreviewed_dest" ]; then
+        python3 -c "
+import json, sys, datetime
+with open(sys.argv[1], 'r') as f:
+    data = json.load(f)
+data['_unreviewed_dir'] = sys.argv[2]
+data['_processed_at'] = datetime.datetime.now().isoformat()
+with open(sys.argv[2] + '/metadata.json', 'w') as f:
+    json.dump(data, f, indent=2)
+" "$processing_file" "$unreviewed_dest" 2>/dev/null || true
     fi
 
-    # Re-process from staging with (potentially edited) metadata
-    if [ "$job_type" = "audio-cd" ] && [ -n "$artist" ] && [ -n "$album" ] && [ -n "$staging_dir" ] && [ -d "$staging_dir" ]; then
-        local tracks_json
-        tracks_json=$(python3 -c "
-import json, sys
-with open(sys.argv[1]) as f:
-    job = json.load(f)
-print(json.dumps(job.get('tracks', [])))
-" "$review_file" 2>/dev/null || echo "[]")
-
-        local ext="$format"
-        local safe_artist safe_album
-        safe_artist=$(echo "$artist" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
-        safe_album=$(echo "$album" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
-
-        # Remove old library output (in case metadata was edited and dest changed)
-        local final_dir="$MUSIC_DIR/$safe_artist/$safe_album"
-
-        # Determine the old library directory to clean up.
-        # Primary: _original_dest recorded during process_audio_cd_job.
-        # Fallback: compute from _original_artist/_original_album saved on first edit.
-        local original_dir=""
-        original_dir=$(grep -oP '"_original_dest"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-        if [ -z "$original_dir" ]; then
-            # Fallback: compute from original (pre-edit) artist/album if available
-            local orig_artist orig_album
-            orig_artist=$(grep -oP '"_original_artist"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-            orig_album=$(grep -oP '"_original_album"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-            if [ -n "$orig_artist" ] && [ -n "$orig_album" ]; then
-                local safe_orig_artist safe_orig_album
-                safe_orig_artist=$(echo "$orig_artist" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
-                safe_orig_album=$(echo "$orig_album" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
-                original_dir="$MUSIC_DIR/$safe_orig_artist/$safe_orig_album"
-            fi
-        fi
-        if [ -n "$original_dir" ] && [ -d "$original_dir" ] && [ "$original_dir" != "$final_dir" ]; then
-            log "Removing old library dir (metadata was edited): $original_dir"
-            rm -rf "$original_dir"
-            local old_parent
-            old_parent=$(dirname "$original_dir")
-            if [ -d "$old_parent" ] && [ "$(basename "$old_parent")" != "Music" ]; then
-                rmdir "$old_parent" 2>/dev/null || true
-            fi
-        fi
-
-        # (Re)create final dir and process from staging
-        mkdir -p "$final_dir"
-        chown autorip:autorip "$MUSIC_DIR/$safe_artist" 2>/dev/null || true
-        chmod 777 "$MUSIC_DIR/$safe_artist" 2>/dev/null || true
-
-        local -a track_names
-        while IFS= read -r name; do
-            track_names+=("$name")
-        done < <(python3 -c "
-import json, sys
-tracks = json.loads(sys.argv[1])
-for t in tracks:
-    print(t)
-" "$tracks_json" 2>/dev/null)
-
-        local track_count=${#track_names[@]}
-
-        # Remove any previously copied files in final_dir before re-processing
-        find "$final_dir" -maxdepth 1 -name "*.$ext" -delete 2>/dev/null || true
-
-        local file_num=0
-        while IFS= read -r audio_file; do
-            [ -f "$audio_file" ] || continue
-            file_num=$((file_num + 1))
-
-            local tracknum
-            tracknum=$(printf '%02d' "$file_num")
-            local track_name=""
-            if [ "$file_num" -le "$track_count" ]; then
-                track_name="${track_names[$((file_num - 1))]}"
-            fi
-
-            # Re-tag the file
-            if [ "$ext" = "mp3" ] && command -v eyeD3 >/dev/null 2>&1; then
-                local eyeD3_args=()
-                eyeD3_args+=(--artist "$artist")
-                eyeD3_args+=(--album "$album")
-                eyeD3_args+=(--track "$file_num")
-                if [ -n "$track_name" ]; then
-                    eyeD3_args+=(--title "$track_name")
-                fi
-                if [ -f "$staging_dir/cover.jpg" ]; then
-                    eyeD3_args+=(--add-image "$staging_dir/cover.jpg:FRONT_COVER")
-                fi
-                eyeD3 "${eyeD3_args[@]}" "$audio_file" 2>&1 || true
-            elif [ "$ext" = "flac" ] && command -v metaflac >/dev/null 2>&1; then
-                metaflac --remove-all-tags "$audio_file" 2>/dev/null || true
-                metaflac --set-tag="ARTIST=$artist" \
-                         --set-tag="ALBUM=$album" \
-                         --set-tag="TRACKNUMBER=$file_num" \
-                         "$audio_file" 2>&1 || true
-                if [ -n "$track_name" ]; then
-                    metaflac --set-tag="TITLE=$track_name" "$audio_file" 2>&1 || true
-                fi
-                if [ -f "$staging_dir/cover.jpg" ]; then
-                    metaflac --import-picture-from="$staging_dir/cover.jpg" "$audio_file" 2>&1 || true
-                fi
-            fi
-
-            local new_name
-            if [ -n "$track_name" ]; then
-                local safe_track
-                safe_track=$(echo "$track_name" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
-                new_name="${tracknum} - ${safe_track}.${ext}"
-            else
-                new_name="${tracknum}.${ext}"
-            fi
-            cp -f "$audio_file" "$final_dir/$new_name"
-            log "  → $new_name"
-        done < <(find "$staging_dir" -maxdepth 1 -name "*.$ext" 2>/dev/null | sort)
-
-        if [ -f "$staging_dir/cover.jpg" ]; then
-            cp -f "$staging_dir/cover.jpg" "$final_dir/cover.jpg"
-        fi
-
-        # Make library files accessible to NFS clients (Picard, etc.)
-        chown -R autorip:autorip "$final_dir" 2>/dev/null || true
-        chmod 777 "$final_dir" 2>/dev/null || true
-        chmod 666 "$final_dir"/* 2>/dev/null || true
-
-        log "Re-processed $file_num track(s) to $final_dir"
-
-        # Log to rip history
-        local cover_rel=""
-        if [ -f "$final_dir/cover.jpg" ]; then
-            cover_rel="Audio/Music/$safe_artist/$safe_album/cover.jpg"
-        fi
-        log_rip_entry "Audio CD" "$artist" "$album" "$tracks_json" "$cover_rel"
-    elif [ "$job_type" != "audio-cd" ]; then
-        # Video jobs: if disc_title was edited, re-run rename from staging for all files
-        local disc_title
-        disc_title=$(grep -oP '"disc_title"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-
-        if [ -n "$disc_title" ]; then
-            # Multi-file disc job: iterate files array
-            local -a v_file_paths=()
-            local -a v_title_indices=()
-            if grep -q '"files"' "$review_file" 2>/dev/null; then
-                while IFS= read -r fp; do
-                    [ -n "$fp" ] && v_file_paths+=("$fp")
-                done < <(grep -oP '"file_path"\s*:\s*"\K[^"]+' "$review_file")
-                while IFS= read -r tidx; do
-                    [ -n "$tidx" ] && v_title_indices+=("$tidx")
-                done < <(grep -oP '"title_index"\s*:\s*\K[0-9]+' "$review_file")
-            else
-                # Legacy single-file job
-                local fp
-                fp=$(grep -m1 -oP '"file_path"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-                [ -n "$fp" ] && v_file_paths=("$fp")
-                local tidx
-                tidx=$(grep -m1 -oP '"title_index"\s*:\s*\K[0-9]+' "$review_file" 2>/dev/null || echo "0")
-                v_title_indices=("$tidx")
-            fi
-
-            for i in "${!v_file_paths[@]}"; do
-                local fp="${v_file_paths[$i]}"
-                local tidx="${v_title_indices[$i]:-$((i+1))}"
-                if [ -f "$fp" ]; then
-                    if parse_tv_disc_title "$disc_title"; then
-                        tv_rename_file "$fp" "$tidx"
-                    else
-                        movie_rename_file "$fp" "$disc_title"
-                    fi
-                fi
-            done
-        fi
-    fi
-
-    # Clean staging directory
+    # Clean staging — files have been moved to the unreviewed dir
     if [ -n "$staging_dir" ] && [ -d "$staging_dir" ]; then
         local dir_size
         dir_size=$(du -sh "$staging_dir" 2>/dev/null | cut -f1)
@@ -1023,107 +734,240 @@ for t in tracks:
         fi
     fi
 
-    rm -f "$review_file"
-    log "Approved: $(basename "$review_file")"
-    echo "OK"
+    # Remove the processing file — unreviewed dir metadata.json is now the record
+    rm -f "$processing_file"
+    log "Job complete (pending review in unreviewed): $disc_title ($total_files title(s))"
 }
 
-# ---------- reject: reject a single reviewed job (remove from library + staging) ----------
-reject_single() {
-    local job_id="$1"
-    local review_file=""
+# ==========================================================================
+# Subcommands
+# ==========================================================================
 
-    for f in "$QUEUE_DIR"/*.review; do
-        [ -f "$f" ] || continue
-        local base
-        base=$(basename "$f")
-        if [ "$base" = "$job_id" ] || [ "$base" = "${job_id}.review" ] || [ "${base%.review}" = "$job_id" ]; then
-            review_file="$f"
-            break
+# ---------- clean: approve all unreviewed items and move to library ----------
+clean_reviewed() {
+    local review_count=0
+
+    # Scan the unreviewed directory tree for metadata.json files
+    while IFS= read -r meta_file; do
+        [ -f "$meta_file" ] || continue
+        review_count=$((review_count + 1))
+
+        local item_dir
+        item_dir=$(dirname "$meta_file")
+        local rel_path="${item_dir#$UNREVIEWED_DIR/}"
+        local final_dir="$OUTPUT_BASE/$rel_path"
+
+        # Determine job type from metadata
+        local job_type
+        job_type=$(grep -oP '"job_type"\s*:\s*"\K[^"]+' "$meta_file" 2>/dev/null || echo "video")
+
+        log "Approving: $rel_path"
+        mkdir -p "$final_dir"
+
+        # Move all non-metadata files to the final library location
+        find "$item_dir" -maxdepth 1 -type f ! -name "metadata.json" -exec mv -f {} "$final_dir/" \;
+
+        # Make library files accessible
+        chown -R autorip:autorip "$final_dir" 2>/dev/null || true
+        chmod 777 "$final_dir" 2>/dev/null || true
+        chmod 666 "$final_dir"/* 2>/dev/null || true
+
+        # Log audio rips to rip history
+        if [ "$job_type" = "audio-cd" ]; then
+            local artist album tracks_json cover_rel=""
+            artist=$(grep -oP '"artist"\s*:\s*"\K[^"]+' "$meta_file" 2>/dev/null || true)
+            album=$(grep -oP '"album"\s*:\s*"\K[^"]+' "$meta_file" 2>/dev/null || true)
+            tracks_json=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    job = json.load(f)
+print(json.dumps(job.get('tracks', [])))
+" "$meta_file" 2>/dev/null || echo "[]")
+            if [ -f "$final_dir/cover.jpg" ]; then
+                cover_rel="${rel_path}/cover.jpg"
+            fi
+            if [ -n "$artist" ] && [ -n "$album" ]; then
+                log_rip_entry "Audio CD" "$artist" "$album" "$tracks_json" "$cover_rel"
+            fi
         fi
-    done
 
-    if [ -z "$review_file" ]; then
-        echo "ERROR: No review job found matching: $job_id" >&2
+        # Remove the unreviewed item directory (now empty except metadata.json)
+        rm -rf "$item_dir"
+        # Clean empty parent directories
+        local parent_dir
+        parent_dir=$(dirname "$item_dir")
+        while [ "$parent_dir" != "$UNREVIEWED_DIR" ] && [ -d "$parent_dir" ]; do
+            rmdir "$parent_dir" 2>/dev/null || break
+            parent_dir=$(dirname "$parent_dir")
+        done
+    done < <(find "$UNREVIEWED_DIR" -name "metadata.json" -type f 2>/dev/null | sort)
+
+    if [ "$review_count" -eq 0 ]; then
+        log "No unreviewed items to approve."
+    else
+        log "Approved $review_count item(s)."
+    fi
+}
+
+# ---------- list: show unreviewed items ----------
+list_reviewed() {
+    local count=0
+    while IFS= read -r meta_file; do
+        [ -f "$meta_file" ] || continue
+        count=$((count + 1))
+
+        local item_dir
+        item_dir=$(dirname "$meta_file")
+        local rel_path="${item_dir#$UNREVIEWED_DIR/}"
+        local dir_size
+        dir_size=$(du -sh "$item_dir" 2>/dev/null | cut -f1)
+
+        local job_type artist album disc_title
+        job_type=$(grep -oP '"job_type"\s*:\s*"\K[^"]+' "$meta_file" 2>/dev/null || echo "video")
+        disc_title=$(grep -oP '"disc_title"\s*:\s*"\K[^"]+' "$meta_file" 2>/dev/null || true)
+        artist=$(grep -oP '"artist"\s*:\s*"\K[^"]+' "$meta_file" 2>/dev/null || true)
+        album=$(grep -oP '"album"\s*:\s*"\K[^"]+' "$meta_file" 2>/dev/null || true)
+
+        if [ "$job_type" = "audio-cd" ]; then
+            echo "  [$count] Audio CD: $artist / $album"
+        else
+            local file_count
+            file_count=$(find "$item_dir" -maxdepth 1 -name "*.mkv" 2>/dev/null | wc -l)
+            echo "  [$count] Video: ${disc_title:-$rel_path} ($file_count file(s))"
+        fi
+        echo "       Path: $rel_path ($dir_size)"
+    done < <(find "$UNREVIEWED_DIR" -name "metadata.json" -type f 2>/dev/null | sort)
+
+    if [ "$count" -eq 0 ]; then
+        echo "No items pending review."
+    else
+        echo ""
+        echo "$count item(s) pending review."
+        echo "Run '$0 clean' to approve all and move to library."
+    fi
+}
+
+# ---------- approve: approve a single unreviewed item ----------
+approve_single() {
+    local item_path="$1"
+
+    # item_path is relative to UNREVIEWED_DIR, e.g. "Video/Movies/Apollo 13 (1995)"
+    local item_dir="$UNREVIEWED_DIR/$item_path"
+    local meta_file="$item_dir/metadata.json"
+
+    if [ ! -f "$meta_file" ]; then
+        echo "ERROR: No unreviewed item found at: $item_path" >&2
         exit 1
     fi
 
-    log "Rejecting job: $(basename "$review_file")"
+    local rel_path="$item_path"
+    local final_dir="$OUTPUT_BASE/$rel_path"
 
-    local job_type="" artist="" album="" staging_dir="" file_path="" format=""
-    job_type=$(grep -oP '"job_type"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || echo "video")
-    artist=$(grep -oP '"artist"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-    album=$(grep -oP '"album"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-    staging_dir=$(grep -oP '"staging_dir"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-    format=$(grep -oP '"format"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || echo "mp3")
+    log "Approving: $rel_path"
+    mkdir -p "$final_dir"
 
-    if [ -z "$staging_dir" ]; then
-        file_path=$(grep -oP '"file_path"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-        staging_dir=$(dirname "$file_path" 2>/dev/null || echo "")
-    fi
+    # Move all non-metadata files to the final library location
+    find "$item_dir" -maxdepth 1 -type f ! -name "metadata.json" -exec mv -f {} "$final_dir/" \;
 
-    # Remove from final library
-    if [ "$job_type" = "audio-cd" ] && [ -n "$artist" ] && [ -n "$album" ]; then
-        local safe_artist safe_album
-        safe_artist=$(echo "$artist" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
-        safe_album=$(echo "$album" | sed -e 's/^\.*//' | tr -d ':><|*/"'"'"'?\\!')
-        local final_dir="$MUSIC_DIR/$safe_artist/$safe_album"
-        if [ -d "$final_dir" ]; then
-            log "Removing from library: $final_dir"
-            rm -rf "$final_dir"
-            # Clean up empty artist dir
-            local artist_dir="$MUSIC_DIR/$safe_artist"
-            if [ -d "$artist_dir" ]; then
-                rmdir "$artist_dir" 2>/dev/null || true
-            fi
+    # Make library files accessible
+    chown -R autorip:autorip "$final_dir" 2>/dev/null || true
+    chmod 777 "$final_dir" 2>/dev/null || true
+    chmod 666 "$final_dir"/* 2>/dev/null || true
+
+    # Log audio rips to rip history
+    local job_type
+    job_type=$(grep -oP '"job_type"\s*:\s*"\K[^"]+' "$meta_file" 2>/dev/null || echo "video")
+    if [ "$job_type" = "audio-cd" ]; then
+        local artist album tracks_json cover_rel=""
+        artist=$(grep -oP '"artist"\s*:\s*"\K[^"]+' "$meta_file" 2>/dev/null || true)
+        album=$(grep -oP '"album"\s*:\s*"\K[^"]+' "$meta_file" 2>/dev/null || true)
+        tracks_json=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    job = json.load(f)
+print(json.dumps(job.get('tracks', [])))
+" "$meta_file" 2>/dev/null || echo "[]")
+        if [ -f "$final_dir/cover.jpg" ]; then
+            cover_rel="${rel_path}/cover.jpg"
+        fi
+        if [ -n "$artist" ] && [ -n "$album" ]; then
+            log_rip_entry "Audio CD" "$artist" "$album" "$tracks_json" "$cover_rel"
         fi
     fi
 
-    # Clean staging directory
-    if [ -n "$staging_dir" ] && [ -d "$staging_dir" ]; then
-        log "Cleaning staging: $staging_dir"
-        rm -rf "$staging_dir"
-        local parent_dir
-        parent_dir=$(dirname "$staging_dir")
-        if [ -d "$parent_dir" ] && [ "$(basename "$parent_dir")" != ".autorip-staging" ]; then
-            rmdir "$parent_dir" 2>/dev/null || true
-        fi
+    # Remove the unreviewed item directory
+    rm -rf "$item_dir"
+    # Clean empty parent directories
+    local parent_dir
+    parent_dir=$(dirname "$item_dir")
+    while [ "$parent_dir" != "$UNREVIEWED_DIR" ] && [ -d "$parent_dir" ]; do
+        rmdir "$parent_dir" 2>/dev/null || break
+        parent_dir=$(dirname "$parent_dir")
+    done
+
+    log "Approved: $rel_path"
+    echo "OK"
+}
+
+# ---------- reject: reject a single unreviewed item ----------
+reject_single() {
+    local item_path="$1"
+
+    local item_dir="$UNREVIEWED_DIR/$item_path"
+    local meta_file="$item_dir/metadata.json"
+
+    if [ ! -f "$meta_file" ]; then
+        echo "ERROR: No unreviewed item found at: $item_path" >&2
+        exit 1
     fi
 
-    rm -f "$review_file"
-    log "Rejected and cleaned: $(basename "$review_file")"
+    log "Rejecting: $item_path"
+
+    # Remove the entire unreviewed item directory
+    rm -rf "$item_dir"
+    # Clean empty parent directories
+    local parent_dir
+    parent_dir=$(dirname "$item_dir")
+    while [ "$parent_dir" != "$UNREVIEWED_DIR" ] && [ -d "$parent_dir" ]; do
+        rmdir "$parent_dir" 2>/dev/null || break
+        parent_dir=$(dirname "$parent_dir")
+    done
+
+    log "Rejected and cleaned: $item_path"
     echo "OK"
 }
 
 # ---------- Handle subcommands ----------
 case "${1:-}" in
     clean)
-        mkdir -p "$QUEUE_DIR"
-        log "Cleaning reviewed jobs..."
+        mkdir -p "$QUEUE_DIR" "$UNREVIEWED_DIR"
+        log "Approving all unreviewed items..."
         clean_reviewed
         exit 0
         ;;
     approve)
-        mkdir -p "$QUEUE_DIR"
+        mkdir -p "$QUEUE_DIR" "$UNREVIEWED_DIR"
         if [ -z "${2:-}" ]; then
-            echo "Usage: $0 approve <job_file>" >&2
+            echo "Usage: $0 approve <item_path>" >&2
+            echo "  item_path is relative to .unreviewed/, e.g. Video/Movies/Apollo 13 (1995)" >&2
             exit 1
         fi
         approve_single "$2"
         exit 0
         ;;
     reject)
-        mkdir -p "$QUEUE_DIR"
+        mkdir -p "$QUEUE_DIR" "$UNREVIEWED_DIR"
         if [ -z "${2:-}" ]; then
-            echo "Usage: $0 reject <job_file>" >&2
+            echo "Usage: $0 reject <item_path>" >&2
+            echo "  item_path is relative to .unreviewed/, e.g. Video/Movies/Apollo 13 (1995)" >&2
             exit 1
         fi
         reject_single "$2"
         exit 0
         ;;
     list|review|status)
-        mkdir -p "$QUEUE_DIR"
-        echo "=== Jobs pending review ==="
+        mkdir -p "$QUEUE_DIR" "$UNREVIEWED_DIR"
+        echo "=== Items pending review ==="
         list_reviewed
         exit 0
         ;;
@@ -1131,12 +975,12 @@ case "${1:-}" in
         # No subcommand or flags — fall through to normal job processing
         ;;
     *)
-        echo "Usage: $0 [clean|list|approve <job>|reject <job>]" >&2
+        echo "Usage: $0 [clean|list|approve <path>|reject <path>]" >&2
         echo "  (no args)  Process pending queue jobs" >&2
-        echo "  list       Show jobs pending review" >&2
-        echo "  clean      Approve all and purge staging" >&2
-        echo "  approve    Approve a single job" >&2
-        echo "  reject     Reject a single job (removes from library)" >&2
+        echo "  list       Show items pending review" >&2
+        echo "  clean      Approve all and move to library" >&2
+        echo "  approve    Approve a single item (path relative to .unreviewed/)" >&2
+        echo "  reject     Reject a single item (deletes from unreviewed)" >&2
         exit 1
         ;;
 esac
@@ -1145,6 +989,7 @@ esac
 # Main loop — process all pending jobs then exit
 # ==========================================================================
 mkdir -p "$QUEUE_DIR"
+mkdir -p "$UNREVIEWED_DIR" "$UNREVIEWED_MOVIES" "$UNREVIEWED_TV" "$UNREVIEWED_MUSIC"
 
 # Prevent concurrent worker instances (timer may fire while processing)
 LOCKFILE="/tmp/transcode-worker.lock"

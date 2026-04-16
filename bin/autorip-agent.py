@@ -10,10 +10,10 @@ Provides:
     POST /rip             — Trigger a rip on the specified device
     POST /eject           — Eject the specified device
     GET  /transcode-queue — Shared GPU transcode queue state
-    GET  /review/jobs     — List all jobs pending review with metadata
-    POST /review/edit     — Edit metadata of a review job before approval
-    POST /review/approve  — Approve a single reviewed job
-    POST /review/reject   — Reject a single reviewed job
+    GET  /review/jobs     — List all items pending review (from .unreviewed/ dir)
+    POST /review/edit     — Edit metadata of an unreviewed item
+    POST /review/approve  — Approve a single unreviewed item (moves to library)
+    POST /review/reject   — Reject a single unreviewed item (deletes)
     GET  /health          — Health check
 
 Configuration is read from /etc/autorip/autorip.conf (or $AUTORIP_CONF).
@@ -61,6 +61,7 @@ DEVICE_RE = re.compile(r"^sr[0-9]+$")
 OUTPUT_BASE = _config.get("OUTPUT_BASE", "/mnt/nas")
 AGENT_PORT = int(_config.get("AGENT_PORT", "7800"))
 QUEUE_DIR = os.path.join(OUTPUT_BASE, ".autorip-queue")
+UNREVIEWED_DIR = os.path.join(OUTPUT_BASE, ".unreviewed")
 
 
 def _valid_job_id(job_id):
@@ -491,58 +492,62 @@ WORKER_SCRIPT = os.path.join(
 
 @app.route("/review/jobs")
 def review_jobs():
-    """List all jobs in the review state with full metadata."""
+    """List all items in the unreviewed directory with metadata."""
     jobs = []
-    if not os.path.isdir(QUEUE_DIR):
+    if not os.path.isdir(UNREVIEWED_DIR):
         return jsonify({"jobs": jobs})
 
-    for entry in sorted(os.listdir(QUEUE_DIR)):
-        if not entry.endswith(".review"):
+    for root, dirs, files in os.walk(UNREVIEWED_DIR):
+        if "metadata.json" not in files:
             continue
-        filepath = os.path.join(QUEUE_DIR, entry)
+        meta_path = os.path.join(root, "metadata.json")
+        rel_path = os.path.relpath(root, UNREVIEWED_DIR)
         try:
-            with open(filepath, "r") as f:
+            with open(meta_path, "r") as f:
                 data = json.load(f)
-            data["job_file"] = entry
-            data["job_id"] = entry.removesuffix(".review")
-            # Check staging exists
-            sdir = data.get("staging_dir", "")
-            if sdir:
-                data["staging_exists"] = os.path.isdir(sdir)
-            # Single-file jobs
-            fpath = data.get("file_path", "")
-            if fpath:
-                data["file_exists"] = os.path.isfile(fpath)
-            # Multi-file disc jobs: check each file in the files array
-            files = data.get("files", [])
-            for f in files:
-                fp = f.get("file_path", "")
-                if fp:
-                    f["file_exists"] = os.path.isfile(fp)
+            data["item_path"] = rel_path
+            # List media files in the directory
+            media_files = []
+            for fname in sorted(files):
+                if fname == "metadata.json":
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    size = os.path.getsize(fpath)
+                except OSError:
+                    size = 0
+                media_files.append({"name": fname, "size": size})
+            data["media_files"] = media_files
+            # Total size
+            total_size = sum(f["size"] for f in media_files)
+            data["total_size"] = total_size
             jobs.append(data)
         except (json.JSONDecodeError, OSError):
-            jobs.append({"job_file": entry, "job_id": entry.removesuffix(".review"),
-                         "error": "unreadable"})
+            jobs.append({"item_path": rel_path, "error": "unreadable"})
+
     return jsonify({"jobs": jobs})
 
 
 @app.route("/review/edit", methods=["POST"])
 def review_edit():
-    """Edit metadata fields of a review job before approving.
+    """Edit metadata fields of an unreviewed item.
 
-    Accepts JSON: { "job_id": "...", "fields": { "artist": "...", "album": "...", "tracks": [...] } }
-    Only allows editing known metadata fields in .review files.
+    Accepts JSON: { "item_path": "Video/Movies/...", "fields": { "disc_title": "...", ... } }
+    Only allows editing known metadata fields in metadata.json.
     """
     if not request.is_json:
         return jsonify({"error": "JSON body required"}), 400
-    job_id = request.json.get("job_id", "")
+    item_path = request.json.get("item_path", "")
     fields = request.json.get("fields", {})
-    if not job_id:
-        return jsonify({"error": "Missing job_id"}), 400
-    if not _valid_job_id(job_id):
-        return jsonify({"error": "Invalid job_id"}), 400
+    if not item_path:
+        return jsonify({"error": "Missing item_path"}), 400
     if not fields:
         return jsonify({"error": "No fields to update"}), 400
+
+    # Prevent path traversal
+    safe = os.path.normpath(item_path)
+    if safe.startswith("..") or safe.startswith("/"):
+        return jsonify({"error": "Invalid item_path"}), 400
 
     # Only allow editing safe metadata fields
     EDITABLE_FIELDS = {"artist", "album", "tracks", "disc_title"}
@@ -550,26 +555,17 @@ def review_edit():
     if unknown:
         return jsonify({"error": f"Cannot edit fields: {', '.join(unknown)}"}), 400
 
-    # Find the .review file
-    review_file = None
-    for f in os.listdir(QUEUE_DIR):
-        if not f.endswith(".review"):
-            continue
-        base = f.removesuffix(".review")
-        if f == job_id or f == f"{job_id}.review" or base == job_id:
-            review_file = os.path.join(QUEUE_DIR, f)
-            break
-
-    if not review_file or not os.path.isfile(review_file):
-        return jsonify({"error": f"No review job found matching: {job_id}"}), 404
+    meta_file = os.path.join(UNREVIEWED_DIR, safe, "metadata.json")
+    if not os.path.isfile(meta_file):
+        return jsonify({"error": f"No unreviewed item at: {item_path}"}), 404
 
     try:
-        with open(review_file, "r") as fh:
+        with open(meta_file, "r") as fh:
             data = json.load(fh)
     except (json.JSONDecodeError, OSError) as exc:
-        return jsonify({"error": f"Failed to read job: {exc}"}), 500
+        return jsonify({"error": f"Failed to read metadata: {exc}"}), 500
 
-    # Snapshot original values on first edit so approve can find the old library path
+    # Snapshot original values on first edit
     for key in fields:
         orig_key = f"_original_{key}"
         if orig_key not in data and key in data:
@@ -580,11 +576,11 @@ def review_edit():
         data[key] = value
 
     # Write back atomically
-    tmp_path = review_file + ".tmp"
+    tmp_path = meta_file + ".tmp"
     try:
         with open(tmp_path, "w") as fh:
             json.dump(data, fh, indent=2)
-        os.replace(tmp_path, review_file)
+        os.replace(tmp_path, meta_file)
     except OSError as exc:
         return jsonify({"error": f"Failed to write: {exc}"}), 500
 
@@ -594,22 +590,27 @@ def review_edit():
 
 @app.route("/review/lookup", methods=["POST"])
 def review_lookup():
-    """Look up metadata from a MusicBrainz release URL and update a review job.
+    """Look up metadata from a MusicBrainz release URL and update an unreviewed item.
 
-    Accepts JSON: { "job_id": "...", "musicbrainz_url": "https://musicbrainz.org/release/..." }
-    Fetches artist, album, and track names from the MusicBrainz API and applies
-    them to the .review file (preserving original values for approve cleanup).
+    Accepts JSON: { "item_path": "Audio/Music/...", "musicbrainz_url": "https://musicbrainz.org/release/..." }
     """
     if not request.is_json:
         return jsonify({"error": "JSON body required"}), 400
-    job_id = request.json.get("job_id", "")
+    item_path = request.json.get("item_path", "").strip()
     mb_url = request.json.get("musicbrainz_url", "").strip()
-    if not job_id:
-        return jsonify({"error": "Missing job_id"}), 400
-    if not _valid_job_id(job_id):
-        return jsonify({"error": "Invalid job_id"}), 400
+    if not item_path:
+        return jsonify({"error": "Missing item_path"}), 400
     if not mb_url:
         return jsonify({"error": "Missing musicbrainz_url"}), 400
+
+    # Prevent path traversal
+    safe = os.path.normpath(item_path)
+    if safe.startswith("..") or safe.startswith("/"):
+        return jsonify({"error": "Invalid item_path"}), 400
+
+    meta_file = os.path.join(UNREVIEWED_DIR, safe, "metadata.json")
+    if not os.path.isfile(meta_file):
+        return jsonify({"error": f"No unreviewed item at: {item_path}"}), 404
 
     # Extract release MBID from the URL
     # Accepts: https://musicbrainz.org/release/<uuid>
@@ -624,19 +625,6 @@ def review_lookup():
     if not m:
         return jsonify({"error": "Could not parse MusicBrainz release ID from URL"}), 400
     release_id = m.group(1).lower()
-
-    # Find the .review file
-    review_file = None
-    for f in os.listdir(QUEUE_DIR):
-        if not f.endswith(".review"):
-            continue
-        base = f.removesuffix(".review")
-        if f == job_id or f == f"{job_id}.review" or base == job_id:
-            review_file = os.path.join(QUEUE_DIR, f)
-            break
-
-    if not review_file or not os.path.isfile(review_file):
-        return jsonify({"error": f"No review job found matching: {job_id}"}), 404
 
     # Fetch release metadata from the MusicBrainz JSON API
     import urllib.request
@@ -656,7 +644,6 @@ def review_lookup():
         return jsonify({"error": f"MusicBrainz API unreachable: {e}"}), 502
 
     artist = mb_data.get("artist-credit-phrase") or ""
-    # Fallback: build artist from artist-credit array if phrase is null
     if not artist:
         credits = mb_data.get("artist-credit", [])
         if credits:
@@ -675,18 +662,18 @@ def review_lookup():
     disc_total = len(media)
     disc_number = 1
 
-    # Try to match by disc_id if the review job has one
+    # Read existing metadata
     try:
-        with open(review_file, "r") as fh:
+        with open(meta_file, "r") as fh:
             job_data = json.load(fh)
     except (json.JSONDecodeError, OSError) as exc:
-        return jsonify({"error": f"Failed to read job: {exc}"}), 500
+        return jsonify({"error": f"Failed to read metadata: {exc}"}), 500
 
     job_disc_id = job_data.get("disc_id", "")
     job_track_count = len(job_data.get("tracks", []))
     matched_medium = None
 
-    # Strategy 1: match by disc_id (most reliable)
+    # Strategy 1: match by disc_id
     if job_disc_id:
         for medium in media:
             for disc in medium.get("discs", []):
@@ -697,8 +684,7 @@ def review_lookup():
             if matched_medium:
                 break
 
-    # Strategy 2: match by track count (for multi-disc releases where
-    # disc_id didn't match — e.g. the disc isn't in MB's disc ID list)
+    # Strategy 2: match by track count
     if not matched_medium and disc_total > 1 and job_track_count > 0:
         for medium in media:
             if len(medium.get("tracks", [])) == job_track_count:
@@ -716,7 +702,6 @@ def review_lookup():
             rec = track.get("recording", {})
             tracks.append(rec.get("title", f"Track {track.get('number', '?')}"))
 
-    # Multi-disc: append disc number to album
     if disc_total > 1:
         album = f"{album} (Disc {disc_number})"
 
@@ -729,11 +714,11 @@ def review_lookup():
         job_data[key] = value
 
     # Write back atomically
-    tmp_path = review_file + ".tmp"
+    tmp_path = meta_file + ".tmp"
     try:
         with open(tmp_path, "w") as fh:
             json.dump(job_data, fh, indent=2)
-        os.replace(tmp_path, review_file)
+        os.replace(tmp_path, meta_file)
     except OSError as exc:
         return jsonify({"error": f"Failed to write: {exc}"}), 500
 
@@ -749,36 +734,37 @@ def review_lookup():
 
 @app.route("/review/approve", methods=["POST"])
 def review_approve():
-    """Approve a single reviewed job — logs to rip history + cleans staging."""
-    job_id = request.json.get("job_id", "") if request.is_json else ""
-    if not job_id:
-        return jsonify({"error": "Missing job_id"}), 400
-    # Sanitise: block path traversal while allowing Unicode filenames
-    if not _valid_job_id(job_id):
-        return jsonify({"error": "Invalid job_id"}), 400
+    """Approve a single unreviewed item — moves to library."""
+    item_path = request.json.get("item_path", "") if request.is_json else ""
+    if not item_path:
+        return jsonify({"error": "Missing item_path"}), 400
+    safe = os.path.normpath(item_path)
+    if safe.startswith("..") or safe.startswith("/"):
+        return jsonify({"error": "Invalid item_path"}), 400
     result = subprocess.run(
-        [WORKER_SCRIPT, "approve", job_id],
+        [WORKER_SCRIPT, "approve", safe],
         capture_output=True, text=True, timeout=30,
     )
     if result.returncode == 0:
-        return jsonify({"ok": True, "message": f"Approved {job_id}"})
+        return jsonify({"ok": True, "message": f"Approved {item_path}"})
     return jsonify({"error": result.stderr.strip() or "approve failed"}), 500
 
 
 @app.route("/review/reject", methods=["POST"])
 def review_reject():
-    """Reject a single reviewed job — removes from library + cleans staging."""
-    job_id = request.json.get("job_id", "") if request.is_json else ""
-    if not job_id:
-        return jsonify({"error": "Missing job_id"}), 400
-    if not _valid_job_id(job_id):
-        return jsonify({"error": "Invalid job_id"}), 400
+    """Reject a single unreviewed item — deletes from unreviewed dir."""
+    item_path = request.json.get("item_path", "") if request.is_json else ""
+    if not item_path:
+        return jsonify({"error": "Missing item_path"}), 400
+    safe = os.path.normpath(item_path)
+    if safe.startswith("..") or safe.startswith("/"):
+        return jsonify({"error": "Invalid item_path"}), 400
     result = subprocess.run(
-        [WORKER_SCRIPT, "reject", job_id],
+        [WORKER_SCRIPT, "reject", safe],
         capture_output=True, text=True, timeout=30,
     )
     if result.returncode == 0:
-        return jsonify({"ok": True, "message": f"Rejected {job_id}"})
+        return jsonify({"ok": True, "message": f"Rejected {item_path}"})
     return jsonify({"error": result.stderr.strip() or "reject failed"}), 500
 
 
