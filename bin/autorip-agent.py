@@ -793,6 +793,56 @@ def review_lookup():
             job_data[orig_key] = job_data[key]
         job_data[key] = value
 
+    # Rename track files to match MusicBrainz track names
+    item_dir = os.path.join(UNREVIEWED_DIR, safe)
+    renamed_files = []
+    media_ext = job_data.get("format", "mp3")
+    existing_files = sorted(
+        f for f in os.listdir(item_dir)
+        if f != "metadata.json" and not f.endswith(".tmp")
+    )
+    for i, track_name in enumerate(tracks):
+        if i >= len(existing_files):
+            break
+        old_name = existing_files[i]
+        # Sanitise track name for filesystem
+        safe_track = re.sub(r'[<>:"/\\|?*]', '_', track_name)
+        track_num = f"{i + 1:02d}"
+        ext = os.path.splitext(old_name)[1]  # preserve actual extension
+        new_name = f"{track_num} - {safe_track}{ext}"
+        if new_name != old_name:
+            old_fp = os.path.join(item_dir, old_name)
+            new_fp = os.path.join(item_dir, new_name)
+            if os.path.isfile(old_fp) and not os.path.exists(new_fp):
+                os.rename(old_fp, new_fp)
+                renamed_files.append({"old": old_name, "new": new_name})
+
+    # Move directory to Artist/Album structure
+    new_rel = os.path.join("Audio", "Music", re.sub(r'[<>:"/\\|?*]', '_', artist),
+                           re.sub(r'[<>:"/\\|?*]', '_', album))
+    new_item_dir = os.path.join(UNREVIEWED_DIR, new_rel)
+    new_item_path = safe  # default: unchanged
+    if new_item_dir != item_dir:
+        if not os.path.exists(new_item_dir):
+            os.makedirs(os.path.dirname(new_item_dir), exist_ok=True)
+            os.rename(item_dir, new_item_dir)
+            new_item_path = new_rel
+            item_dir = new_item_dir
+            meta_file = os.path.join(item_dir, "metadata.json")
+            job_data["_unreviewed_dir"] = item_dir
+            # Clean up empty parent dirs left behind
+            old_parent = os.path.join(UNREVIEWED_DIR, safe)
+            for _ in range(3):
+                old_parent = os.path.dirname(old_parent)
+                if old_parent == UNREVIEWED_DIR:
+                    break
+                try:
+                    os.rmdir(old_parent)  # only removes if empty
+                except OSError:
+                    break
+
+    job_data["item_path"] = new_item_path
+
     # Write back atomically
     tmp_path = meta_file + ".tmp"
     try:
@@ -804,10 +854,12 @@ def review_lookup():
 
     return jsonify({
         "ok": True,
-        "message": f"Identified: {artist} — {album} ({len(tracks)} tracks)",
+        "message": f"Identified: {artist} — {album} ({len(tracks)} tracks, {len(renamed_files)} files renamed)",
         "artist": artist,
         "album": album,
         "tracks": tracks,
+        "item_path": new_item_path,
+        "renamed_files": renamed_files,
         "job": job_data,
     })
 
