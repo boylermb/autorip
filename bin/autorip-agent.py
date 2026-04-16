@@ -424,6 +424,14 @@ def eject():
         text=True,
     )
     if result.returncode == 0:
+        # Clear stale status and cover art for this device
+        status_file = os.path.join(STATUS_DIR, f"status-{device}.json")
+        art_file = os.path.join(ART_DIR, "cover.jpg")
+        for f in (status_file, art_file):
+            try:
+                os.remove(f)
+            except FileNotFoundError:
+                pass
         return jsonify({"ok": True, "message": f"Ejected /dev/{device}"})
     else:
         return jsonify(
