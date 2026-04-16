@@ -55,6 +55,7 @@ MNAMER_MOVIE_FORMAT="${MNAMER_MOVIE_FORMAT:-{name} ({year})/{name} ({year}){exte
 
 EPISODES_PER_DISC="${EPISODES_PER_DISC:-4}"
 UHD_KEEP_ORIGINAL="${UHD_KEEP_ORIGINAL:-yes}"
+NNEDI3_WEIGHTS="${NNEDI3_WEIGHTS:-/usr/share/ffmpeg/nnedi3_weights.bin}"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $LOGPREFIX $*"; }
 
@@ -508,10 +509,47 @@ transcode_file() {
         -show_entries stream=codec_name -of csv=p=0 "$file_path" 2>/dev/null | tr -d ',' | tr -d ' ' || true)
 
     if [ "$video_codec" = "mpeg2video" ]; then
+        # Detect interlaced content
+        local field_order vf_filters=""
+        field_order=$(ffprobe -loglevel error -select_streams v:0 \
+            -show_entries stream=field_order -of csv=p=0 "$file_path" 2>/dev/null | tr -d ',' | tr -d ' ' || true)
+
+        if [ "$field_order" = "tt" ] || [ "$field_order" = "bb" ] || [ "$field_order" = "tb" ] || [ "$field_order" = "bt" ]; then
+            if [ -f "$NNEDI3_WEIGHTS" ]; then
+                log "Interlaced ($field_order) — applying nnedi deinterlace + denoise"
+                vf_filters="-vf nnedi=weights=${NNEDI3_WEIGHTS}:deint=all:field=af,hqdn3d=3:2:3:2"
+            else
+                log "Interlaced ($field_order) — nnedi weights not found, using bwdif + denoise"
+                vf_filters="-vf bwdif=1:0:0,hqdn3d=3:2:3:2"
+            fi
+        else
+            # Not flagged as interlaced, but MPEG-2 DVDs sometimes lie — run idet
+            local idet_result
+            idet_result=$(ffmpeg -i "$file_path" -vf "idet" -frames:v 500 -an -f null - 2>&1 | grep "Multi frame" | tail -1 || true)
+            local tff bff prog
+            tff=$(echo "$idet_result" | grep -oP 'TFF:\s*\K[0-9]+' || echo "0")
+            bff=$(echo "$idet_result" | grep -oP 'BFF:\s*\K[0-9]+' || echo "0")
+            prog=$(echo "$idet_result" | grep -oP 'Progressive:\s*\K[0-9]+' || echo "0")
+            local interlaced_frames=$(( tff + bff ))
+            if [ "$interlaced_frames" -gt "$prog" ] 2>/dev/null; then
+                if [ -f "$NNEDI3_WEIGHTS" ]; then
+                    log "Detected interlaced content (idet: TFF=$tff BFF=$bff Prog=$prog) — applying nnedi + denoise"
+                    vf_filters="-vf nnedi=weights=${NNEDI3_WEIGHTS}:deint=all:field=af,hqdn3d=3:2:3:2"
+                else
+                    log "Detected interlaced (idet) — nnedi weights not found, using bwdif + denoise"
+                    vf_filters="-vf bwdif=1:0:0,hqdn3d=3:2:3:2"
+                fi
+            else
+                log "Progressive content — applying light denoise only"
+                vf_filters="-vf hqdn3d=3:2:3:2"
+            fi
+        fi
+
         log "Transcoding $basename_mkv (MPEG-2 → H.265)..."
         local transcode_tmp="${file_path%.mkv}.transcoding.mkv"
         if ffmpeg -i "$file_path" \
             -map 0 \
+            $vf_filters \
             $ffmpeg_video_opts \
             -c:a copy \
             -c:s copy \
