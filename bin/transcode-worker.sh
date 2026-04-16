@@ -488,6 +488,48 @@ with open(sys.argv[1], 'w') as f:
     log "Audio CD job complete (pending review): $artist / $album ($file_num tracks)"
 }
 
+# ---------- Transcode a single MKV file ----------
+transcode_file() {
+    local file_path="$1"
+    local is_uhd="$2"
+    local ffmpeg_video_opts="$3"
+
+    local basename_mkv
+    basename_mkv=$(basename "$file_path")
+
+    # ---------- UHD Blu-ray: skip transcode ----------
+    if [ "$is_uhd" = "true" ] && [ "$UHD_KEEP_ORIGINAL" = "yes" ]; then
+        log "$basename_mkv is 4K UHD — skipping transcode (UHD_KEEP_ORIGINAL=yes)"
+        return 0
+    fi
+
+    local video_codec
+    video_codec=$(ffprobe -loglevel error -select_streams v:0 \
+        -show_entries stream=codec_name -of csv=p=0 "$file_path" 2>/dev/null | tr -d ',' | tr -d ' ' || true)
+
+    if [ "$video_codec" = "mpeg2video" ]; then
+        log "Transcoding $basename_mkv (MPEG-2 → H.265)..."
+        local transcode_tmp="${file_path%.mkv}.transcoding.mkv"
+        if ffmpeg -i "$file_path" \
+            -map 0 \
+            $ffmpeg_video_opts \
+            -c:a copy \
+            -c:s copy \
+            -movflags +faststart \
+            -y "$transcode_tmp" 2>&1; then
+            mv -f "$transcode_tmp" "$file_path"
+            log "Transcoded $basename_mkv successfully"
+        else
+            log "WARNING: Failed to transcode $basename_mkv"
+            rm -f "$transcode_tmp"
+            return 1
+        fi
+    else
+        log "$basename_mkv already $video_codec, skipping transcode"
+    fi
+    return 0
+}
+
 # ---------- Process a single job ----------
 process_job() {
     local job_file="$1"
@@ -498,23 +540,50 @@ process_job() {
     update_worker_status "transcoding" "$job_file" "Reading job..."
 
     # Parse job JSON (minimal — use grep/sed, no jq dependency)
-    local disc_title file_path disc_type source_host title_index title_count is_uhd
+    local disc_title disc_type source_host title_count is_uhd staging_dir
     disc_title=$(grep -oP '"disc_title"\s*:\s*"\K[^"]+' "$job_file" || echo "")
-    file_path=$(grep -oP '"file_path"\s*:\s*"\K[^"]+' "$job_file" || echo "")
     disc_type=$(grep -oP '"disc_type"\s*:\s*"\K[^"]+' "$job_file" || echo "DVD")
     source_host=$(grep -oP '"source_host"\s*:\s*"\K[^"]+' "$job_file" || echo "unknown")
-    title_index=$(grep -oP '"title_index"\s*:\s*\K[0-9]+' "$job_file" || echo "0")
     title_count=$(grep -oP '"title_count"\s*:\s*\K[0-9]+' "$job_file" || echo "0")
     is_uhd=$(grep -oP '"is_uhd"\s*:\s*\K(true|false)' "$job_file" || echo "false")
+    staging_dir=$(grep -oP '"staging_dir"\s*:\s*"\K[^"]+' "$job_file" || echo "")
 
-    if [ -z "$disc_title" ] || [ -z "$file_path" ]; then
-        log "ERROR: Invalid job file $job_name (missing disc_title or file_path)"
+    # Detect multi-file disc job (has files[] array) vs legacy single-file job
+    local -a file_paths=()
+    local -a title_indices=()
+    if grep -q '"files"' "$job_file" 2>/dev/null; then
+        # Multi-file disc job — extract file_path entries from files array
+        while IFS= read -r fpath; do
+            [ -n "$fpath" ] && file_paths+=("$fpath")
+        done < <(grep -oP '"file_path"\s*:\s*"\K[^"]+' "$job_file")
+        while IFS= read -r tidx; do
+            [ -n "$tidx" ] && title_indices+=("$tidx")
+        done < <(grep -oP '"title_index"\s*:\s*\K[0-9]+' "$job_file")
+    else
+        # Legacy single-file job
+        local file_path title_index
+        file_path=$(grep -oP '"file_path"\s*:\s*"\K[^"]+' "$job_file" || echo "")
+        title_index=$(grep -oP '"title_index"\s*:\s*\K[0-9]+' "$job_file" || echo "0")
+        file_paths=("$file_path")
+        title_indices=("$title_index")
+        if [ -z "$staging_dir" ] && [ -n "$file_path" ]; then
+            staging_dir=$(dirname "$file_path")
+        fi
+    fi
+
+    if [ -z "$disc_title" ] || [ ${#file_paths[@]} -eq 0 ] || [ -z "${file_paths[0]}" ]; then
+        log "ERROR: Invalid job file $job_name (missing disc_title or files)"
         mv "$job_file" "${job_file%.json}.error"
         return 1
     fi
 
-    if [ ! -f "$file_path" ]; then
-        log "ERROR: File $file_path does not exist"
+    # Verify at least one file exists
+    local any_exist=false
+    for fp in "${file_paths[@]}"; do
+        [ -f "$fp" ] && any_exist=true && break
+    done
+    if ! $any_exist; then
+        log "ERROR: No source files exist for $disc_title"
         mv "$job_file" "${job_file%.json}.error"
         return 1
     fi
@@ -523,9 +592,7 @@ process_job() {
     mv "$job_file" "${job_file%.json}.processing"
     local processing_file="${job_file%.json}.processing"
 
-    local basename_mkv
-    basename_mkv=$(basename "$file_path")
-    log "Transcoding $basename_mkv [$title_index/$title_count] for $disc_title (from $source_host)"
+    log "Processing disc: $disc_title (${#file_paths[@]} title(s), from $source_host)"
 
     # Detect GPU
     local ffmpeg_video_opts="-c:v libx265 -crf 24 -preset medium"
@@ -534,60 +601,43 @@ process_job() {
         ffmpeg_video_opts="-c:v hevc_nvenc -preset medium -rc constqp -qp 24"
     fi
 
-    update_worker_status "transcoding" "$processing_file" "[$title_index/$title_count] $basename_mkv"
+    local file_num=0
+    local total_files=${#file_paths[@]}
+    for i in "${!file_paths[@]}"; do
+        local fp="${file_paths[$i]}"
+        local tidx="${title_indices[$i]:-$((i+1))}"
+        file_num=$((file_num + 1))
 
-    # ---------- UHD Blu-ray: skip transcode ----------
-    # 4K UHD content is already H.265/HEVC with HDR metadata.  Re-encoding
-    # would destroy HDR10/Dolby Vision data and take an extremely long time
-    # at 4K resolution.  Keep the original MakeMKV output as-is.
-    if [ "$is_uhd" = "true" ] && [ "$UHD_KEEP_ORIGINAL" = "yes" ]; then
-        log "$basename_mkv is 4K UHD — skipping transcode (UHD_KEEP_ORIGINAL=yes)"
-    else
-        # Check if needs transcoding
-        local video_codec
-        video_codec=$(ffprobe -loglevel error -select_streams v:0 \
-            -show_entries stream=codec_name -of csv=p=0 "$file_path" 2>/dev/null | tr -d ',' | tr -d ' ' || true)
-
-        if [ "$video_codec" = "mpeg2video" ]; then
-            log "Transcoding $basename_mkv (MPEG-2 → H.265)..."
-            local transcode_tmp="${file_path%.mkv}.transcoding.mkv"
-            if ffmpeg -i "$file_path" \
-                -map 0 \
-                $ffmpeg_video_opts \
-                -c:a copy \
-                -c:s copy \
-                -movflags +faststart \
-                -y "$transcode_tmp" 2>&1; then
-                mv -f "$transcode_tmp" "$file_path"
-                log "Transcoded $basename_mkv successfully"
-            else
-                log "WARNING: Failed to transcode $basename_mkv"
-                rm -f "$transcode_tmp"
-                mv "$processing_file" "${processing_file%.processing}.error"
-                return 1
-            fi
-        else
-            log "$basename_mkv already $video_codec, skipping transcode"
+        if [ ! -f "$fp" ]; then
+            log "WARNING: File $fp does not exist, skipping"
+            continue
         fi
-    fi
 
-    # Rename/move file to final location
-    update_worker_status "renaming" "$processing_file" "[$title_index/$title_count] Organizing..."
-    if parse_tv_disc_title "$disc_title"; then
-        log "TV disc: $TV_SHOW Season $TV_SEASON Disc $TV_DISC — episode from title $title_index"
-        tv_rename_file "$file_path" "$title_index"
-    else
-        log "Movie disc: $disc_title"
-        movie_rename_file "$file_path" "$disc_title"
-    fi
+        local basename_mkv
+        basename_mkv=$(basename "$fp")
+        update_worker_status "transcoding" "$processing_file" "[$file_num/$total_files] $basename_mkv"
+
+        if ! transcode_file "$fp" "$is_uhd" "$ffmpeg_video_opts"; then
+            log "WARNING: Failed to transcode $basename_mkv, continuing"
+        fi
+
+        # Rename/move file to final location
+        update_worker_status "renaming" "$processing_file" "[$file_num/$total_files] Organizing..."
+        if parse_tv_disc_title "$disc_title"; then
+            log "TV disc: $TV_SHOW Season $TV_SEASON Disc $TV_DISC — episode from title $tidx"
+            tv_rename_file "$fp" "$tidx"
+        else
+            log "Movie disc: $disc_title"
+            movie_rename_file "$fp" "$disc_title"
+        fi
+    done
 
     # Keep staging directory for review — files are copied, not moved.
-    # Run `transcode-worker.sh clean` to purge reviewed staging dirs.
-    log "Staging kept for review: $(dirname "$file_path")"
+    log "Staging kept for review: $staging_dir"
 
     # Mark job as needing review (staging still present)
     mv "$processing_file" "${processing_file%.processing}.review"
-    log "Job complete (pending review): $disc_title [$title_index/$title_count]"
+    log "Job complete (pending review): $disc_title ($total_files title(s))"
 }
 
 # ==========================================================================
@@ -696,7 +746,10 @@ list_reviewed() {
         if [ "$job_type" = "audio-cd" ]; then
             echo "  [$count] Audio CD: $artist / $album"
         else
-            echo "  [$count] Video: $disc_title"
+            # Count files in multi-file disc jobs
+            local file_count
+            file_count=$(grep -c '"file_path"' "$review_file" 2>/dev/null || echo "1")
+            echo "  [$count] Video: $disc_title ($file_count title(s))"
         fi
         echo "       Staging: $staging_dir [$dir_status]$dir_size"
         echo "       Job: $(basename "$review_file")"
@@ -880,19 +933,42 @@ for t in tracks:
         fi
         log_rip_entry "Audio CD" "$artist" "$album" "$tracks_json" "$cover_rel"
     elif [ "$job_type" != "audio-cd" ]; then
-        # Video jobs: if disc_title was edited, re-run rename from staging
+        # Video jobs: if disc_title was edited, re-run rename from staging for all files
         local disc_title
         disc_title=$(grep -oP '"disc_title"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-        file_path=$(grep -oP '"file_path"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
-        local title_index
-        title_index=$(grep -oP '"title_index"\s*:\s*\K[0-9]+' "$review_file" 2>/dev/null || echo "0")
 
-        if [ -n "$disc_title" ] && [ -n "$file_path" ] && [ -f "$file_path" ]; then
-            if parse_tv_disc_title "$disc_title"; then
-                tv_rename_file "$file_path" "$title_index"
+        if [ -n "$disc_title" ]; then
+            # Multi-file disc job: iterate files array
+            local -a v_file_paths=()
+            local -a v_title_indices=()
+            if grep -q '"files"' "$review_file" 2>/dev/null; then
+                while IFS= read -r fp; do
+                    [ -n "$fp" ] && v_file_paths+=("$fp")
+                done < <(grep -oP '"file_path"\s*:\s*"\K[^"]+' "$review_file")
+                while IFS= read -r tidx; do
+                    [ -n "$tidx" ] && v_title_indices+=("$tidx")
+                done < <(grep -oP '"title_index"\s*:\s*\K[0-9]+' "$review_file")
             else
-                movie_rename_file "$file_path" "$disc_title"
+                # Legacy single-file job
+                local fp
+                fp=$(grep -m1 -oP '"file_path"\s*:\s*"\K[^"]+' "$review_file" 2>/dev/null || true)
+                [ -n "$fp" ] && v_file_paths=("$fp")
+                local tidx
+                tidx=$(grep -m1 -oP '"title_index"\s*:\s*\K[0-9]+' "$review_file" 2>/dev/null || echo "0")
+                v_title_indices=("$tidx")
             fi
+
+            for i in "${!v_file_paths[@]}"; do
+                local fp="${v_file_paths[$i]}"
+                local tidx="${v_title_indices[$i]:-$((i+1))}"
+                if [ -f "$fp" ]; then
+                    if parse_tv_disc_title "$disc_title"; then
+                        tv_rename_file "$fp" "$tidx"
+                    else
+                        movie_rename_file "$fp" "$disc_title"
+                    fi
+                fi
+            done
         fi
     fi
 

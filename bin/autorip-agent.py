@@ -131,6 +131,11 @@ def read_transcode_queue():
             else:
                 data["file_exists"] = False
                 data["file_transcoding"] = False
+            # Multi-file disc jobs: check each file
+            for f in data.get("files", []):
+                fp = f.get("file_path", "")
+                if fp:
+                    f["file_exists"] = os.path.isfile(fp)
             # Audio-cd jobs: check staging dir
             sdir = data.get("staging_dir", "")
             if sdir:
@@ -504,9 +509,16 @@ def review_jobs():
             sdir = data.get("staging_dir", "")
             if sdir:
                 data["staging_exists"] = os.path.isdir(sdir)
+            # Single-file jobs
             fpath = data.get("file_path", "")
             if fpath:
                 data["file_exists"] = os.path.isfile(fpath)
+            # Multi-file disc jobs: check each file in the files array
+            files = data.get("files", [])
+            for f in files:
+                fp = f.get("file_path", "")
+                if fp:
+                    f["file_exists"] = os.path.isfile(fp)
             jobs.append(data)
         except (json.JSONDecodeError, OSError):
             jobs.append({"job_file": entry, "job_id": entry.removesuffix(".review"),

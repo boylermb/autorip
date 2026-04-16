@@ -484,34 +484,53 @@ movie_fallback() {
     log "Moved unidentified files to $fallback_dir"
 }
 
-# ---------- Enqueue transcode job for GPU worker ----------
-enqueue_transcode() {
+# ---------- Enqueue video disc job for GPU worker ----------
+# Creates a single job per disc with a files[] array listing all ripped MKV
+# titles.  The transcode worker processes each file and creates one .review
+# job for the whole disc, avoiding the staging-dir-deleted-under-siblings bug.
+enqueue_video_disc() {
     local disc_title="$1"
-    local file_path="$2"
-    local disc_type="$3"
-    local title_index="$4"
-    local title_count="$5"
-    local is_uhd="${6:-false}"
+    local disc_type="$2"
+    local is_uhd="${3:-false}"
+    local staging_dir="$4"
+    shift 4
+    # Remaining args are "title_index:file_path" pairs
+    local -a file_entries=("$@")
 
     mkdir -p "$QUEUE_DIR"
-    local job_file="$QUEUE_DIR/${HOSTNAME}_${disc_title}_t$(printf '%02d' "$title_index")_$(date +%s).json"
+    local job_file="$QUEUE_DIR/${HOSTNAME}_${disc_title}_$(date +%s).json"
     local tmpfile
     tmpfile=$(mktemp "$QUEUE_DIR/.job.XXXXXX")
     chmod 644 "$tmpfile"
+
+    local files_json="["
+    local first=true
+    local title_count=${#file_entries[@]}
+    for entry in "${file_entries[@]}"; do
+        local tidx="${entry%%:*}"
+        local fpath="${entry#*:}"
+        $first || files_json+=","
+        first=false
+        files_json+="
+        {\"title_index\": $tidx, \"file_path\": \"$fpath\"}"
+    done
+    files_json+="
+    ]"
+
     cat > "$tmpfile" <<ENDJOB
 {
     "disc_title": "$(printf '%s' "$disc_title" | sed 's/\\/\\\\/g; s/"/\\"/g')",
-    "file_path": "$file_path",
     "disc_type": "$disc_type",
     "is_uhd": $is_uhd,
-    "title_index": $title_index,
+    "staging_dir": "$staging_dir",
     "title_count": $title_count,
+    "files": $files_json,
     "source_host": "$HOSTNAME",
     "submitted": "$(date '+%Y-%m-%d %H:%M:%S')"
 }
 ENDJOB
     mv -f "$tmpfile" "$job_file"
-    log "Queued: $(basename "$job_file")"
+    log "Queued disc: $(basename "$job_file") ($title_count title(s))"
 }
 
 # ---------- Enqueue audio CD post-processing job ----------
@@ -715,6 +734,8 @@ rip_video_disc() {
     OUTPUT_DIR="$STAGING_DIR/$DISC_TITLE"
     mkdir -p "$OUTPUT_DIR"
 
+    # Collect title_index:file_path entries for the single disc job
+    local -a ripped_files=()
     CURRENT=0
     for tid in "${TITLE_IDS[@]}"; do
         CURRENT=$((CURRENT + 1))
@@ -736,8 +757,8 @@ rip_video_disc() {
                     log "WARNING: $(basename "$mkv_file") has no audio streams!"
                 fi
 
-                log "Title $tid ripped: $(basename "$mkv_file") — enqueueing for transcode"
-                enqueue_transcode "$DISC_TITLE" "$mkv_file" "$disc_type" "$CURRENT" "$TITLE_COUNT" "$is_uhd"
+                log "Title $tid ripped: $(basename "$mkv_file")"
+                ripped_files+=("${CURRENT}:${mkv_file}")
                 touch "$LOCKFILE"
             else
                 log "WARNING: Could not find MKV file for title $tid"
@@ -747,7 +768,13 @@ rip_video_disc() {
         fi
     done
 
-    update_status "complete" "$disc_type" "$DISC_TITLE" "$TITLE_COUNT title(s) queued for transcode" "" "$DISC_TITLE" "[]"
+    if [ ${#ripped_files[@]} -gt 0 ]; then
+        enqueue_video_disc "$DISC_TITLE" "$disc_type" "$is_uhd" "$OUTPUT_DIR" "${ripped_files[@]}"
+    else
+        log "WARNING: No titles ripped successfully"
+    fi
+
+    update_status "complete" "$disc_type" "$DISC_TITLE" "${#ripped_files[@]} title(s) queued for transcode" "" "$DISC_TITLE" "[]"
 
     # Record this rip in the shared log
     local video_tracks_json
