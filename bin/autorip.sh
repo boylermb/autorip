@@ -721,6 +721,52 @@ rip_video_disc() {
         TITLE_IDS+=( "$tid" )
     done < <(echo "$MAKEMKV_INFO" | grep '^TINFO:' | cut -d',' -f1 | sed 's/^TINFO://' | sort -un)
 
+    # --- Filter out "play all" consolidated titles ---
+    # On multi-episode DVD/Blu-ray box sets, MakeMKV often includes a playlist
+    # that concatenates all episodes into one giant title.  Detect and skip it
+    # by comparing durations: if one title is ≥2.5x the median duration of the
+    # others, it's almost certainly the "play all" concatenation.
+    if [ "${#TITLE_IDS[@]}" -ge 3 ]; then
+        # Extract duration (attribute 9) for each title in seconds
+        declare -A title_durations=()
+        for tid in "${TITLE_IDS[@]}"; do
+            local dur_str
+            dur_str=$(echo "$MAKEMKV_INFO" | grep "^TINFO:${tid},9," | head -1 | sed 's/.*,"//' | tr -d '"' || true)
+            if [ -n "$dur_str" ]; then
+                local h m s
+                IFS=: read -r h m s <<< "$dur_str"
+                title_durations[$tid]=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+            fi
+        done
+
+        if [ "${#title_durations[@]}" -ge 3 ]; then
+            # Sort durations to find median
+            local -a sorted_durs=()
+            while IFS= read -r d; do
+                sorted_durs+=("$d")
+            done < <(for tid in "${TITLE_IDS[@]}"; do echo "${title_durations[$tid]:-0}"; done | sort -n)
+            local median_idx=$(( ${#sorted_durs[@]} / 2 ))
+            local median_dur="${sorted_durs[$median_idx]}"
+
+            if [ "$median_dur" -gt 0 ] 2>/dev/null; then
+                local -a filtered_ids=()
+                for tid in "${TITLE_IDS[@]}"; do
+                    local tdur="${title_durations[$tid]:-0}"
+                    # Skip titles ≥2.5x the median (consolidated "play all")
+                    local threshold=$(( median_dur * 25 / 10 ))
+                    if [ "$tdur" -ge "$threshold" ] 2>/dev/null; then
+                        log "Skipping title $tid — likely 'play all' (${title_durations[$tid]}s vs median ${median_dur}s)"
+                    else
+                        filtered_ids+=("$tid")
+                    fi
+                done
+                if [ "${#filtered_ids[@]}" -ge 2 ]; then
+                    TITLE_IDS=("${filtered_ids[@]}")
+                fi
+            fi
+        fi
+    fi
+
     TITLE_COUNT=${#TITLE_IDS[@]}
     if [ "$TITLE_COUNT" -eq 0 ]; then
         log "ERROR: No titles found on $disc_type disc"
