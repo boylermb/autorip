@@ -75,7 +75,7 @@ update_status() {
     local tracks_completed="${9:-0}"
     local current_track="${10:-}"
     local has_art="false"
-    if [ -f "$STATUS_DIR/cover.jpg" ]; then
+    if [ -f "$STATUS_DIR/cover-$(basename "$DEVICE").jpg" ]; then
         has_art="true"
     fi
     mkdir -p "$STATUS_DIR"
@@ -370,7 +370,7 @@ try:
         print('OK')
 except Exception as e:
     print(f'FAIL: {e}', file=sys.stderr)
-" "$artist" "$album" "$STATUS_DIR/cover.jpg" 2>/dev/null || true
+" "$artist" "$album" "$STATUS_DIR/cover-$(basename "$DEVICE").jpg" 2>/dev/null || true
     fi
 }
 
@@ -549,8 +549,8 @@ enqueue_audio_job() {
     chmod 644 "$tmpfile"
 
     # Copy cover art into staging dir if we fetched one
-    if [ -f "$STATUS_DIR/cover.jpg" ] && [ -d "$staging_dir" ]; then
-        cp -f "$STATUS_DIR/cover.jpg" "$staging_dir/cover.jpg"
+    if [ -f "$STATUS_DIR/cover-$(basename "$DEVICE").jpg" ] && [ -d "$staging_dir" ]; then
+        cp -f "$STATUS_DIR/cover-$(basename "$DEVICE").jpg" "$staging_dir/cover.jpg"
     fi
 
     local s_artist s_album s_disc_id s_submission_url
@@ -632,7 +632,7 @@ if ! wait_for_drive; then
 fi
 
 # Clean up old cover art from previous rip
-rm -f "$STATUS_DIR/cover.jpg"
+rm -f "$STATUS_DIR/cover-$(basename "$DEVICE").jpg"
 
 # ---------- Detect disc type ----------
 disc_info=$(udevadm info --query=property --name="$DEVICE" 2>/dev/null || true)

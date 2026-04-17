@@ -165,7 +165,7 @@ def read_status():
             data["online"] = True
             data["hostname"] = HOSTNAME
             data["device"] = dev
-            art_path = os.path.join(ART_DIR, "cover.jpg")
+            art_path = os.path.join(ART_DIR, f"cover-{dev}.jpg")
             data["has_art"] = os.path.exists(art_path)
             per_device[dev] = data
         except (FileNotFoundError, json.JSONDecodeError):
@@ -181,7 +181,7 @@ def read_status():
             data = json.load(f)
         data["online"] = True
         data["hostname"] = HOSTNAME
-        art_path = os.path.join(ART_DIR, "cover.jpg")
+        art_path = os.path.join(ART_DIR, f"cover-{dev}.jpg")
         data["has_art"] = os.path.exists(art_path)
         dev = data.get("device", "sr0") or "sr0"
         return {dev: data}
@@ -373,7 +373,10 @@ def log_endpoint():
 
 @app.route("/art")
 def art():
-    art_path = os.path.join(ART_DIR, "cover.jpg")
+    device = request.args.get("device", "sr0")
+    if not DEVICE_RE.match(device):
+        abort(400)
+    art_path = os.path.join(ART_DIR, f"cover-{device}.jpg")
     if os.path.exists(art_path):
         return send_file(art_path, mimetype="image/jpeg")
     abort(404)
@@ -426,7 +429,7 @@ def eject():
     if result.returncode == 0:
         # Clear stale status and cover art for this device
         status_file = os.path.join(STATUS_DIR, f"status-{device}.json")
-        art_file = os.path.join(ART_DIR, "cover.jpg")
+        art_file = os.path.join(ART_DIR, f"cover-{device}.jpg")
         for f in (status_file, art_file):
             try:
                 os.remove(f)
