@@ -84,7 +84,7 @@ install-makemkv:
 # ==========================================================================
 # install — Full installation
 # ==========================================================================
-install: install-config install-scripts install-services install-agent
+install: install-config install-scripts install-services install-agent install-worker
 	@echo ""
 	@echo "==> autorip installed.  Next steps:"
 	@echo "    1. Edit $(CONF_FILE) for your environment"
