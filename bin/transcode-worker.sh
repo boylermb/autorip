@@ -615,40 +615,50 @@ transcode_file() {
         -show_entries stream=codec_name -of csv=p=0 "$file_path" 2>/dev/null | tr -d ',' | tr -d ' ' || true)
 
     if [ "$video_codec" = "mpeg2video" ]; then
-        # Detect interlaced content
-        local field_order vf_filters=""
+        # Detect interlaced / telecined content
+        local field_order vf_filters="" needs_deinterlace="false"
         field_order=$(ffprobe -loglevel error -select_streams v:0 \
             -show_entries stream=field_order -of csv=p=0 "$file_path" 2>/dev/null | tr -d ',' | tr -d ' ' || true)
 
         if [ "$field_order" = "tt" ] || [ "$field_order" = "bb" ] || [ "$field_order" = "tb" ] || [ "$field_order" = "bt" ]; then
-            if [ -f "$NNEDI3_WEIGHTS" ]; then
-                log "Interlaced ($field_order) — applying nnedi deinterlace + denoise"
-                vf_filters="-vf nnedi=weights=${NNEDI3_WEIGHTS}:deint=all:field=af,hqdn3d=3:2:3:2"
-            else
-                log "Interlaced ($field_order) — nnedi weights not found, using bwdif + denoise"
-                vf_filters="-vf bwdif=1:0:0,hqdn3d=3:2:3:2"
-            fi
+            log "Interlaced ($field_order) per stream metadata"
+            needs_deinterlace="true"
         else
-            # Not flagged as interlaced, but MPEG-2 DVDs sometimes lie — run idet
+            # MPEG-2 DVDs sometimes lie about field order — run idet on 2000 frames
             local idet_result
-            idet_result=$(ffmpeg -i "$file_path" -vf "idet" -frames:v 500 -an -f null - 2>&1 | grep "Multi frame" | tail -1 || true)
-            local tff bff prog
+            idet_result=$(ffmpeg -i "$file_path" -vf "idet" -frames:v 2000 -an -f null - 2>&1 | grep "Multi frame" | tail -1 || true)
+            local tff bff prog undet
             tff=$(echo "$idet_result" | grep -oP 'TFF:\s*\K[0-9]+' || echo "0")
             bff=$(echo "$idet_result" | grep -oP 'BFF:\s*\K[0-9]+' || echo "0")
             prog=$(echo "$idet_result" | grep -oP 'Progressive:\s*\K[0-9]+' || echo "0")
+            undet=$(echo "$idet_result" | grep -oP 'Undetermined:\s*\K[0-9]+' || echo "0")
             local interlaced_frames=$(( tff + bff ))
+            local total_frames=$(( interlaced_frames + prog + undet ))
+            log "idet results: TFF=$tff BFF=$bff Prog=$prog Undet=$undet"
             if [ "$interlaced_frames" -gt "$prog" ] 2>/dev/null; then
-                if [ -f "$NNEDI3_WEIGHTS" ]; then
-                    log "Detected interlaced content (idet: TFF=$tff BFF=$bff Prog=$prog) — applying nnedi + denoise"
-                    vf_filters="-vf nnedi=weights=${NNEDI3_WEIGHTS}:deint=all:field=af,hqdn3d=3:2:3:2"
-                else
-                    log "Detected interlaced (idet) — nnedi weights not found, using bwdif + denoise"
-                    vf_filters="-vf bwdif=1:0:0,hqdn3d=3:2:3:2"
+                log "Detected interlaced content via idet"
+                needs_deinterlace="true"
+            elif [ "$total_frames" -gt 0 ] && [ "$undet" -gt 0 ] 2>/dev/null; then
+                # High undetermined count with low progressive = likely telecine (3:2 pulldown)
+                local undet_pct=$(( undet * 100 / total_frames ))
+                if [ "$undet_pct" -ge 30 ] 2>/dev/null; then
+                    log "Detected likely telecine ($undet_pct% undetermined) — will deinterlace"
+                    needs_deinterlace="true"
                 fi
-            else
-                log "Progressive content — applying light denoise only"
-                vf_filters="-vf hqdn3d=3:2:3:2"
             fi
+        fi
+
+        if [ "$needs_deinterlace" = "true" ]; then
+            if [ -f "$NNEDI3_WEIGHTS" ]; then
+                log "Applying nnedi deinterlace + denoise"
+                vf_filters="-vf nnedi=weights=${NNEDI3_WEIGHTS}:deint=all:field=af,hqdn3d=3:2:3:2"
+            else
+                log "nnedi weights not found, using bwdif + denoise"
+                vf_filters="-vf bwdif=1:0:0,hqdn3d=3:2:3:2"
+            fi
+        else
+            log "Progressive content — applying light denoise only"
+            vf_filters="-vf hqdn3d=3:2:3:2"
         fi
 
         log "Transcoding $basename_mkv (MPEG-2 → H.265)..."
@@ -664,9 +674,30 @@ transcode_file() {
             mv -f "$transcode_tmp" "$file_path"
             log "Transcoded $basename_mkv successfully"
         else
-            log "WARNING: Failed to transcode $basename_mkv"
             rm -f "$transcode_tmp"
-            return 1
+            # If nnedi failed, retry with bwdif fallback
+            if echo "$vf_filters" | grep -q "nnedi"; then
+                log "nnedi failed — retrying with bwdif deinterlace"
+                vf_filters="-vf bwdif=1:0:0,hqdn3d=3:2:3:2"
+                if ffmpeg -i "$file_path" \
+                    -map 0 \
+                    $vf_filters \
+                    $ffmpeg_video_opts \
+                    -c:a copy \
+                    -c:s copy \
+                    -movflags +faststart \
+                    -y "$transcode_tmp" 2>&1; then
+                    mv -f "$transcode_tmp" "$file_path"
+                    log "Transcoded $basename_mkv successfully (bwdif fallback)"
+                else
+                    log "WARNING: Failed to transcode $basename_mkv (bwdif fallback also failed)"
+                    rm -f "$transcode_tmp"
+                    return 1
+                fi
+            else
+                log "WARNING: Failed to transcode $basename_mkv"
+                return 1
+            fi
         fi
     else
         log "$basename_mkv already $video_codec, skipping transcode"
