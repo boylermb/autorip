@@ -531,6 +531,13 @@ def review_jobs():
             # Total size
             total_size = sum(f["size"] for f in media_files)
             data["total_size"] = total_size
+            # Check for cover art
+            has_art = False
+            for art_name in ("cover.jpg", "cover.png", "folder.jpg"):
+                if os.path.isfile(os.path.join(root, art_name)):
+                    has_art = art_name
+                    break
+            data["has_art"] = has_art
             jobs.append(data)
         except (json.JSONDecodeError, OSError):
             jobs.append({"item_path": rel_path, "error": "unreadable"})
@@ -674,6 +681,86 @@ def review_stream():
     mimetype = mimetypes.get(ext, "application/octet-stream")
 
     return send_file(fpath, mimetype=mimetype, conditional=True)
+
+
+@app.route("/review/art")
+def review_art():
+    """Serve cover art for an unreviewed item.
+
+    Query params: ?item_path=Audio/Music/Artist/Album
+    """
+    item_path = request.args.get("item_path", "").strip()
+    if not item_path:
+        abort(400)
+    safe = os.path.normpath(item_path)
+    if safe.startswith("..") or safe.startswith("/"):
+        abort(400)
+    item_dir = os.path.join(UNREVIEWED_DIR, safe)
+    for art_name in ("cover.jpg", "cover.png", "folder.jpg"):
+        art_path = os.path.join(item_dir, art_name)
+        if os.path.isfile(art_path):
+            return send_file(art_path, conditional=True)
+    abort(404)
+
+
+@app.route("/review/upload-art", methods=["POST"])
+def review_upload_art():
+    """Upload or replace cover art for an unreviewed item.
+
+    Accepts multipart form: item_path (string) + file (image).
+    Also accepts JSON: { "item_path": "...", "url": "https://..." } to fetch from URL.
+    """
+    if request.content_type and "multipart" in request.content_type:
+        item_path = request.form.get("item_path", "").strip()
+        if not item_path:
+            return jsonify({"error": "Missing item_path"}), 400
+        safe = os.path.normpath(item_path)
+        if safe.startswith("..") or safe.startswith("/"):
+            return jsonify({"error": "Invalid item_path"}), 400
+        item_dir = os.path.join(UNREVIEWED_DIR, safe)
+        if not os.path.isdir(item_dir):
+            return jsonify({"error": f"No unreviewed item at: {item_path}"}), 404
+        f = request.files.get("file")
+        if not f:
+            return jsonify({"error": "No file uploaded"}), 400
+        ext = os.path.splitext(f.filename)[1].lower() if f.filename else ".jpg"
+        if ext not in (".jpg", ".jpeg", ".png"):
+            return jsonify({"error": "Only JPG/PNG allowed"}), 400
+        dest = os.path.join(item_dir, "cover" + (".jpg" if ext in (".jpg", ".jpeg") else ".png"))
+        f.save(dest)
+        return jsonify({"ok": True, "message": "Cover art saved"})
+
+    # JSON mode: fetch from URL
+    if not request.is_json:
+        return jsonify({"error": "Multipart form or JSON body required"}), 400
+    item_path = request.json.get("item_path", "").strip()
+    art_url = request.json.get("url", "").strip()
+    if not item_path or not art_url:
+        return jsonify({"error": "Missing item_path or url"}), 400
+    safe = os.path.normpath(item_path)
+    if safe.startswith("..") or safe.startswith("/"):
+        return jsonify({"error": "Invalid item_path"}), 400
+    item_dir = os.path.join(UNREVIEWED_DIR, safe)
+    if not os.path.isdir(item_dir):
+        return jsonify({"error": f"No unreviewed item at: {item_path}"}), 404
+
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(art_url)
+    req.add_header("User-Agent", "autorip/1.0")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            ct = resp.headers.get("Content-Type", "")
+            if "png" in ct:
+                dest = os.path.join(item_dir, "cover.png")
+            else:
+                dest = os.path.join(item_dir, "cover.jpg")
+            with open(dest, "wb") as out:
+                out.write(resp.read())
+    except (urllib.error.URLError, OSError) as e:
+        return jsonify({"error": f"Failed to fetch art: {e}"}), 502
+
+    return jsonify({"ok": True, "message": "Cover art downloaded"})
 
 
 @app.route("/review/lookup", methods=["POST"])
@@ -851,6 +938,24 @@ def review_lookup():
 
     job_data["item_path"] = new_item_path
 
+    # Fetch cover art from Cover Art Archive if missing
+    art_fetched = False
+    has_art = any(
+        os.path.isfile(os.path.join(item_dir, n))
+        for n in ("cover.jpg", "cover.png", "folder.jpg")
+    )
+    if not has_art:
+        caa_url = f"https://coverartarchive.org/release/{release_id}/front-250"
+        caa_req = urllib.request.Request(caa_url)
+        caa_req.add_header("User-Agent", "autorip/1.0")
+        try:
+            with urllib.request.urlopen(caa_req, timeout=15) as caa_resp:
+                with open(os.path.join(item_dir, "cover.jpg"), "wb") as out:
+                    out.write(caa_resp.read())
+                art_fetched = True
+        except (urllib.error.URLError, OSError):
+            pass  # No art available — user can upload manually
+
     # Write back atomically
     tmp_path = meta_file + ".tmp"
     try:
@@ -862,7 +967,7 @@ def review_lookup():
 
     return jsonify({
         "ok": True,
-        "message": f"Identified: {artist} — {album} ({len(tracks)} tracks, {len(renamed_files)} files renamed)",
+        "message": f"Identified: {artist} — {album} ({len(tracks)} tracks, {len(renamed_files)} files renamed{', art fetched' if art_fetched else ''})",
         "artist": artist,
         "album": album,
         "tracks": tracks,
