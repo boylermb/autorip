@@ -287,6 +287,77 @@ parse_tv_disc_title() {
     return 1
 }
 
+# ---------- TMDb episode name lookup ----------
+# Looks up a TV show on TMDb and caches the season episode list.
+# Sets TMDB_EP_NAMES associative array: TMDB_EP_NAMES[ep_num]="Episode Title"
+declare -A TMDB_EP_NAMES
+TMDB_SHOW_CACHED=""
+
+tmdb_fetch_season() {
+    local show="$1"
+    local season="$2"
+    local api_key="${TMDB_API_KEY:-db972a607f2760bb19ff8bb34074b4c7}"
+
+    # Skip if already cached for this show+season
+    local cache_key="${show}::${season}"
+    if [ "$TMDB_SHOW_CACHED" = "$cache_key" ] && [ ${#TMDB_EP_NAMES[@]} -gt 0 ]; then
+        return 0
+    fi
+
+    TMDB_EP_NAMES=()
+    TMDB_SHOW_CACHED=""
+
+    # Search for the show to get its TMDb ID
+    local encoded_show
+    encoded_show=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$show'))" 2>/dev/null) || return 1
+
+    local search_result
+    search_result=$(curl -sf "https://api.themoviedb.org/3/search/tv?query=${encoded_show}&api_key=${api_key}" 2>/dev/null) || {
+        log "TMDb: Search API call failed for '$show'"
+        return 1
+    }
+
+    local show_id
+    show_id=$(echo "$search_result" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+results = data.get('results', [])
+if results:
+    print(results[0]['id'])
+" 2>/dev/null) || return 1
+
+    if [ -z "$show_id" ]; then
+        log "TMDb: No results found for '$show'"
+        return 1
+    fi
+
+    log "TMDb: Found show '$show' → ID $show_id"
+
+    # Fetch season episodes
+    local season_result
+    season_result=$(curl -sf "https://api.themoviedb.org/3/tv/${show_id}/season/${season}?api_key=${api_key}" 2>/dev/null) || {
+        log "TMDb: Season API call failed for show $show_id season $season"
+        return 1
+    }
+
+    # Parse episode names into the associative array
+    eval "$(echo "$season_result" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for ep in data.get('episodes', []):
+    num = ep['episode_number']
+    name = ep['name'].replace(\"'\", \"'\\\\''\").replace('\"', '\\\\\"')
+    print(f\"TMDB_EP_NAMES[{num}]='{name}'\")
+" 2>/dev/null)" || {
+        log "TMDb: Failed to parse season data"
+        return 1
+    }
+
+    TMDB_SHOW_CACHED="$cache_key"
+    log "TMDb: Loaded ${#TMDB_EP_NAMES[@]} episode name(s) for '$show' season $season"
+    return 0
+}
+
 # ---------- TV rename (single file) ----------
 tv_rename_file() {
     local mkv="$1"
@@ -299,7 +370,21 @@ tv_rename_file() {
     # Episode number: (disc - 1) * episodes_per_disc + title_index
     local ep_num=$(( (TV_DISC - 1) * EPISODES_PER_DISC + title_index ))
     local ep_name
-    ep_name=$(printf "%s - S%02dE%02d.mkv" "$TV_SHOW" "$TV_SEASON" "$ep_num")
+
+    # Try to get episode title from TMDb
+    local ep_title=""
+    if tmdb_fetch_season "$TV_SHOW" "$TV_SEASON" 2>/dev/null; then
+        ep_title="${TMDB_EP_NAMES[$ep_num]:-}"
+    fi
+
+    if [ -n "$ep_title" ]; then
+        # Sanitize episode title for filesystem
+        local safe_title
+        safe_title=$(echo "$ep_title" | tr -d ':><|*/"?\\!' | sed 's/  */ /g')
+        ep_name=$(printf "%s - S%02dE%02d - %s.mkv" "$TV_SHOW" "$TV_SEASON" "$ep_num" "$safe_title")
+    else
+        ep_name=$(printf "%s - S%02dE%02d.mkv" "$TV_SHOW" "$TV_SEASON" "$ep_num")
+    fi
     mv -f "$mkv" "$dest_dir/$ep_name"
     log "Moved $(basename "$mkv") → $dest_dir/$ep_name"
 }

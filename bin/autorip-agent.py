@@ -980,6 +980,155 @@ def review_lookup():
     })
 
 
+@app.route("/review/tmdb-lookup", methods=["POST"])
+def review_tmdb_lookup():
+    """Look up TV episode names from TMDb and rename files in an unreviewed item.
+
+    Accepts JSON: {
+        "item_path": "Video/TV/Show/Season 08",
+        "tmdb_url": "https://www.themoviedb.org/tv/484-murder-she-wrote/season/8"
+    }
+    Parses the TMDb show ID and season from the URL, fetches episode names,
+    and renames SxxExx files to include the episode title.
+    """
+    if not request.is_json:
+        return jsonify({"error": "JSON body required"}), 400
+    item_path = request.json.get("item_path", "").strip()
+    tmdb_url = request.json.get("tmdb_url", "").strip()
+    if not item_path:
+        return jsonify({"error": "Missing item_path"}), 400
+    if not tmdb_url:
+        return jsonify({"error": "Missing tmdb_url"}), 400
+
+    safe = os.path.normpath(item_path)
+    if safe.startswith("..") or safe.startswith("/"):
+        return jsonify({"error": "Invalid item_path"}), 400
+
+    item_dir = os.path.join(UNREVIEWED_DIR, safe)
+    if not os.path.isdir(item_dir):
+        # Also check the approved library
+        item_dir_lib = os.path.join(OUTPUT_BASE, safe)
+        if os.path.isdir(item_dir_lib):
+            item_dir = item_dir_lib
+        else:
+            return jsonify({"error": f"No directory at: {item_path}"}), 404
+
+    # Parse TMDb URL: /tv/{id}/season/{num} or /tv/{id}-slug/season/{num}
+    import urllib.request
+    import urllib.error
+    tmdb_re = re.compile(
+        r"themoviedb\.org/tv/(\d+)(?:-[^/]*)?"
+        r"(?:/season/(\d+))?",
+        re.IGNORECASE,
+    )
+    m = tmdb_re.search(tmdb_url)
+    if not m:
+        return jsonify({"error": "Could not parse TMDb show ID from URL"}), 400
+    show_id = m.group(1)
+    season_num = m.group(2)
+
+    # If no season in URL, try to infer from item_path
+    if not season_num:
+        season_re = re.compile(r"[Ss]eason\s*(\d+)", re.IGNORECASE)
+        sm = season_re.search(item_path)
+        if sm:
+            season_num = sm.group(1)
+        else:
+            return jsonify({"error": "Could not determine season number"}), 400
+
+    # Use configured API key, fall back to mnamer's built-in key
+    api_key = _config.get("TMDB_API_KEY") or os.environ.get("TMDB_API_KEY") or "db972a607f2760bb19ff8bb34074b4c7"
+
+    # Fetch season data
+    api_url = f"https://api.themoviedb.org/3/tv/{show_id}/season/{season_num}?api_key={api_key}"
+    api_req = urllib.request.Request(api_url)
+    api_req.add_header("User-Agent", "autorip/1.0")
+    try:
+        with urllib.request.urlopen(api_req, timeout=15) as resp:
+            season_data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return jsonify({"error": f"TMDb API returned HTTP {e.code}"}), 502
+    except (urllib.error.URLError, OSError) as e:
+        return jsonify({"error": f"TMDb API unreachable: {e}"}), 502
+
+    # Build episode name lookup
+    ep_names = {}
+    for ep in season_data.get("episodes", []):
+        ep_names[ep["episode_number"]] = ep["name"]
+
+    if not ep_names:
+        return jsonify({"error": "No episodes found in TMDb season data"}), 404
+
+    # Rename files: match SxxExx pattern and append episode title
+    renamed_files = []
+    ep_pattern = re.compile(r'^(.*S\d{2}E(\d{2}))((?:\s*-\s*.+)?)(\.mkv)$', re.IGNORECASE)
+    for fname in sorted(os.listdir(item_dir)):
+        fm = ep_pattern.match(fname)
+        if not fm:
+            continue
+        ep_num = int(fm.group(2))
+        ep_title = ep_names.get(ep_num)
+        if not ep_title:
+            continue
+        # Sanitize title for filesystem
+        safe_title = re.sub(r'[<>:"/\\|?*]', '_', ep_title).strip()
+        new_name = f"{fm.group(1)} - {safe_title}{fm.group(4)}"
+        if new_name != fname:
+            old_fp = os.path.join(item_dir, fname)
+            new_fp = os.path.join(item_dir, new_name)
+            if os.path.isfile(old_fp) and not os.path.exists(new_fp):
+                os.rename(old_fp, new_fp)
+                renamed_files.append({"old": fname, "new": new_name})
+
+    # Update metadata.json if present
+    meta_file = os.path.join(item_dir, "metadata.json")
+    if os.path.isfile(meta_file):
+        try:
+            with open(meta_file, "r") as fh:
+                job_data = json.load(fh)
+            job_data["tmdb_id"] = show_id
+            job_data["tmdb_season"] = int(season_num)
+            # Update tracks list with episode names
+            tracks = []
+            for fname in sorted(os.listdir(item_dir)):
+                if fname.endswith(".mkv"):
+                    tracks.append(os.path.splitext(fname)[0])
+            job_data["tracks"] = tracks
+            tmp = meta_file + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(job_data, fh, indent=2)
+            os.replace(tmp, meta_file)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Also fetch show poster as cover art if missing
+    art_fetched = False
+    has_art = any(
+        os.path.isfile(os.path.join(item_dir, n))
+        for n in ("cover.jpg", "cover.png", "folder.jpg")
+    )
+    if not has_art:
+        poster_path = season_data.get("poster_path")
+        if poster_path:
+            poster_url = f"https://image.tmdb.org/t/p/w300{poster_path}"
+            poster_req = urllib.request.Request(poster_url)
+            poster_req.add_header("User-Agent", "autorip/1.0")
+            try:
+                with urllib.request.urlopen(poster_req, timeout=15) as poster_resp:
+                    with open(os.path.join(item_dir, "cover.jpg"), "wb") as out:
+                        out.write(poster_resp.read())
+                    art_fetched = True
+            except (urllib.error.URLError, OSError):
+                pass
+
+    return jsonify({
+        "ok": True,
+        "message": f"TMDb: renamed {len(renamed_files)} file(s){', poster fetched' if art_fetched else ''}",
+        "renamed_files": renamed_files,
+        "episode_names": ep_names,
+    })
+
+
 @app.route("/review/approve", methods=["POST"])
 def review_approve():
     """Approve a single unreviewed item — moves to library."""
