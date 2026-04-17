@@ -917,6 +917,10 @@ ENDCONF
             # discs (e.g. "Unknown Album (a3f7c1b2)") so the path is unique.
             canonical_dir="$STAGING_DIR/$artist_dir/$album_dir"
             mkdir -p "$STAGING_DIR/$artist_dir"
+            # Remove any leftover from a previous failed rip
+            if [ -d "$canonical_dir" ]; then
+                rm -rf "$canonical_dir"
+            fi
             mv "$staging_album" "$canonical_dir"
             log "Moved rip output to canonical staging: $canonical_dir"
             staging_album="$canonical_dir"
