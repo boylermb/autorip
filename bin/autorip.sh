@@ -119,13 +119,14 @@ EOF
 # ---------- Library duplicate check ----------
 # Check whether the album already exists in the music library.
 # Returns:
-#   0 — exact duplicate (same track count) → caller should skip
+#   0 — exact duplicate (same track count + disc ID + bitrate) → caller should skip
 #   1 — no match, safe to rip
 #   2 — partial/different match → existing dir renamed to (old), safe to rip
 check_library_duplicate() {
     local artist="$1"
     local album="$2"
     local disc_track_count="$3"
+    local disc_id="${CD_DISC_ID:-}"
     local format="${CD_FORMAT:-mp3}"
 
     # Build the same sanitised path the worker will use
@@ -140,13 +141,43 @@ check_library_duplicate() {
         return 1
     fi
 
+    # Check disc ID from track metadata — if different, this is a different pressing
+    if [ -n "$disc_id" ]; then
+        local sample_file
+        sample_file=$(find "$library_dir" -maxdepth 1 -type f -name "*.${format}" 2>/dev/null | head -1)
+        if [ -n "$sample_file" ]; then
+            local existing_disc_id=""
+            if command -v ffprobe >/dev/null 2>&1; then
+                existing_disc_id=$(ffprobe -v quiet -show_entries format_tags=MusicBrainz\ Disc\ Id -of csv=p=0 "$sample_file" 2>/dev/null || true)
+            fi
+            if [ -n "$existing_disc_id" ] && [ "$existing_disc_id" != "$disc_id" ]; then
+                log "Library has $artist / $album but different disc ID (existing=$existing_disc_id, new=$disc_id) — different pressing, removing old"
+                rm -rf "$library_dir"
+                return 1
+            fi
+        fi
+    fi
+
     # Count audio files in the existing library directory
     local existing_count
     existing_count=$(find "$library_dir" -maxdepth 1 -type f -name "*.${format}" 2>/dev/null | wc -l)
 
     if [ "$existing_count" -eq "$disc_track_count" ] && [ "$disc_track_count" -gt 0 ]; then
-        # Exact match — same number of tracks
-        log "Library already contains $artist / $album ($existing_count tracks) — skipping rip"
+        # Same track count — check bitrate of first file
+        local sample_file
+        sample_file=$(find "$library_dir" -maxdepth 1 -type f -name "*.${format}" 2>/dev/null | head -1)
+        if [ -n "$sample_file" ] && command -v ffprobe >/dev/null 2>&1; then
+            local bitrate
+            bitrate=$(ffprobe -v quiet -select_streams a:0 -show_entries stream=bit_rate -of csv=p=0 "$sample_file" 2>/dev/null)
+            # bitrate is in bits/sec; 320kbps = 320000
+            if [ -n "$bitrate" ] && [ "$bitrate" -lt 310000 ] 2>/dev/null; then
+                log "Library has $artist / $album ($existing_count tracks) but bitrate ${bitrate}bps < 320kbps — removing and re-ripping"
+                rm -rf "$library_dir"
+                return 1
+            fi
+        fi
+        # Exact match at 320kbps (or can't check) — skip
+        log "Library already contains $artist / $album ($existing_count tracks, 320kbps) — skipping rip"
         return 0
     fi
 
@@ -1052,6 +1083,14 @@ ENDCONF
             mv "$staging_album" "$canonical_dir"
             log "Moved rip output to canonical staging: $canonical_dir"
             staging_album="$canonical_dir"
+
+            # Store disc ID in track metadata (TXXX:MusicBrainz Disc Id)
+            if [ -n "$CD_DISC_ID" ] && command -v eyeD3 >/dev/null 2>&1; then
+                for mp3 in "$staging_album"/*.mp3; do
+                    [ -f "$mp3" ] && eyeD3 --user-text-frame="MusicBrainz Disc Id:$CD_DISC_ID" "$mp3" >/dev/null 2>&1 || true
+                done
+                log "Wrote disc ID $CD_DISC_ID to track metadata"
+            fi
 
             # Clean up the now-empty per-rip directory
             rm -rf "$RIP_STAGING"
