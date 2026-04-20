@@ -766,6 +766,107 @@ def review_upload_art():
     return jsonify({"ok": True, "message": "Cover art downloaded"})
 
 
+@app.route("/review/art-search")
+def review_art_search():
+    """Search multiple sources for cover art options.
+
+    Query params: ?artist=...&album=...
+    Returns JSON array of { source, label, thumbnail, full_url }.
+    """
+    import urllib.request as ureq
+    import urllib.parse
+    import urllib.error
+
+    artist = request.args.get("artist", "").strip()
+    album = request.args.get("album", "").strip()
+    if not artist and not album:
+        return jsonify({"error": "Need artist and/or album"}), 400
+
+    ua = "autorip/1.0 (https://github.com/boylermb/autorip)"
+    results = []
+
+    def _get_json(url):
+        r = ureq.Request(url, headers={"User-Agent": ua})
+        with ureq.urlopen(r, timeout=10) as resp:
+            return json.loads(resp.read())
+
+    # --- MusicBrainz CAA (release) ---
+    try:
+        query = urllib.parse.quote(f'artist:"{artist}" AND release:"{album}"')
+        data = _get_json(f"https://musicbrainz.org/ws/2/release/?query={query}&fmt=json&limit=5")
+        for rel in data.get("releases", []):
+            mbid = rel["id"]
+            label = rel.get("title", album)
+            ar = (rel.get("artist-credit", [{}])[0].get("name", "") if rel.get("artist-credit") else "")
+            results.append({
+                "source": "MusicBrainz CAA",
+                "label": f"{ar} – {label}" if ar else label,
+                "thumbnail": f"https://coverartarchive.org/release/{mbid}/front-250",
+                "full_url": f"https://coverartarchive.org/release/{mbid}/front",
+            })
+    except Exception:
+        pass
+
+    import time
+    time.sleep(0.5)
+
+    # --- MusicBrainz CAA (release-group) ---
+    try:
+        query = urllib.parse.quote(f'artist:"{artist}" AND releasegroup:"{album}"')
+        data = _get_json(f"https://musicbrainz.org/ws/2/release-group/?query={query}&fmt=json&limit=3")
+        for rg in data.get("release-groups", []):
+            rgid = rg["id"]
+            label = rg.get("title", album)
+            ar = (rg.get("artist-credit", [{}])[0].get("name", "") if rg.get("artist-credit") else "")
+            results.append({
+                "source": "MusicBrainz CAA (group)",
+                "label": f"{ar} – {label}" if ar else label,
+                "thumbnail": f"https://coverartarchive.org/release-group/{rgid}/front-250",
+                "full_url": f"https://coverartarchive.org/release-group/{rgid}/front",
+            })
+    except Exception:
+        pass
+
+    time.sleep(0.5)
+
+    # --- iTunes ---
+    try:
+        term = urllib.parse.quote(f"{artist} {album}")
+        data = _get_json(f"https://itunes.apple.com/search?term={term}&media=music&entity=album&limit=5")
+        for r in data.get("results", []):
+            art100 = r.get("artworkUrl100", "")
+            if art100:
+                results.append({
+                    "source": "iTunes",
+                    "label": f"{r.get('artistName', '')} – {r.get('collectionName', '')}",
+                    "thumbnail": art100.replace("100x100bb", "250x250bb"),
+                    "full_url": art100.replace("100x100bb", "600x600bb"),
+                })
+    except Exception:
+        pass
+
+    time.sleep(0.5)
+
+    # --- Deezer ---
+    try:
+        term = urllib.parse.quote(f"{artist} {album}")
+        data = _get_json(f"https://api.deezer.com/search/album?q={term}&limit=5")
+        for r in data.get("data", []):
+            thumb = r.get("cover_medium", "") or r.get("cover_small", "")
+            full = r.get("cover_big", "") or r.get("cover_xl", "") or thumb
+            if thumb:
+                results.append({
+                    "source": "Deezer",
+                    "label": f"{r.get('artist', {}).get('name', '')} – {r.get('title', '')}",
+                    "thumbnail": thumb,
+                    "full_url": full,
+                })
+    except Exception:
+        pass
+
+    return jsonify({"results": results})
+
+
 @app.route("/review/lookup", methods=["POST"])
 def review_lookup():
     """Look up metadata from a MusicBrainz release URL and update an unreviewed item.
