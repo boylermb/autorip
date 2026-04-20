@@ -1023,9 +1023,12 @@ ENDCONF
     abcde -d "$DEVICE" -N -n -c "$RIP_CONF" > >(tee "$ABCDE_LOG" >&2) 2>&1 &
     ABCDE_PID=$!
 
-    # Monitor abcde output for track progress
+    # Monitor abcde output for track progress and detect stalls/errors
     tracks_seen=0
     current_track_name=""
+    last_progress_time=$(date +%s)
+    ABCDE_STALL_TIMEOUT=300  # 5 minutes with no progress = stalled
+    abcde_error_detected=""
     while kill -0 "$ABCDE_PID" 2>/dev/null; do
         # Parse the latest "Grabbing track N:" line from abcde output
         latest_grab=$(grep -oP 'Grabbing track \d+: \K.*(?=\.\.\.)' "$ABCDE_LOG" 2>/dev/null | tail -1 || true)
@@ -1038,18 +1041,71 @@ ENDCONF
         if [ "$new_count" -ne "$tracks_seen" ] || [ "$latest_grab" != "$current_track_name" ]; then
             tracks_seen=$new_count
             current_track_name="$latest_grab"
+            last_progress_time=$(date +%s)
             update_status "ripping" "Audio CD" "$CD_ALBUM" \
                 "Ripping track $new_count/$cd_track_count..." \
                 "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON" \
                 "$cd_track_count" "$completed" "$current_track_name"
         fi
+
+        # Check for cdparanoia/rip errors in abcde's working directory
+        # abcde writes errors to an "errors" file in its temp dir
+        abcde_errors_file=$(find /tmp -path "*/abcde.*/errors" -user autorip -newer "$ABCDE_LOG" 2>/dev/null | head -1 || true)
+        if [ -z "$abcde_errors_file" ]; then
+            abcde_errors_file=$(find /tmp -path "*/abcde.*/errors" -user autorip 2>/dev/null | head -1 || true)
+        fi
+        if [ -n "$abcde_errors_file" ] && [ -s "$abcde_errors_file" ]; then
+            abcde_error_detected=$(cat "$abcde_errors_file" 2>/dev/null)
+            log "ERROR: abcde reported rip errors: $abcde_error_detected"
+            # Kill abcde and all its children
+            kill -- -"$ABCDE_PID" 2>/dev/null || kill "$ABCDE_PID" 2>/dev/null || true
+            sleep 2
+            # Force kill if still alive
+            kill -9 -- -"$ABCDE_PID" 2>/dev/null || kill -9 "$ABCDE_PID" 2>/dev/null || true
+            break
+        fi
+
+        # Detect stall: no new tracks grabbed for ABCDE_STALL_TIMEOUT seconds
+        # and abcde log hasn't grown (encoding still happening = not stalled)
+        now=$(date +%s)
+        elapsed=$((now - last_progress_time))
+        if [ "$elapsed" -ge "$ABCDE_STALL_TIMEOUT" ]; then
+            # Check if lame/encoding is still actively running (CPU use)
+            encoding_active=$(pgrep -P "$ABCDE_PID" -f "lame|flac|oggenc" 2>/dev/null || true)
+            if [ -z "$encoding_active" ]; then
+                abcde_error_detected="Rip stalled: no progress for ${elapsed}s and no active encoding"
+                log "ERROR: $abcde_error_detected"
+                kill -- -"$ABCDE_PID" 2>/dev/null || kill "$ABCDE_PID" 2>/dev/null || true
+                sleep 2
+                kill -9 -- -"$ABCDE_PID" 2>/dev/null || kill -9 "$ABCDE_PID" 2>/dev/null || true
+                break
+            else
+                # Encoding still running — reset timer, it's just slow
+                last_progress_time=$now
+            fi
+        fi
+
         sleep 3
     done
 
     # abcde finished — get its exit code
-    wait "$ABCDE_PID"
+    wait "$ABCDE_PID" 2>/dev/null
     abcde_rc=$?
     rm -f "$ABCDE_LOG" "$RIP_CONF"
+
+    # If we detected an error during monitoring, treat as failure
+    if [ -n "$abcde_error_detected" ]; then
+        log "ERROR: CD rip failed for $CD_ARTIST / $CD_ALBUM: $abcde_error_detected"
+        rm -rf "$RIP_STAGING"
+        update_status "error" "Audio CD" "$CD_ALBUM" "Rip failed: $abcde_error_detected" "$CD_ARTIST" "$CD_ALBUM" "$CD_TRACKS_JSON"
+        # Eject the bad disc
+        log "Ejecting failed disc..."
+        sleep 2
+        eject "$DEVICE" 2>/dev/null || true
+        date +%s > "$COOLDOWN_FILE"
+        update_status "idle"
+        exit 1
+    fi
 
     if [ "$abcde_rc" -eq 0 ]; then
         update_status "ripping" "Audio CD" "$CD_ALBUM" \
