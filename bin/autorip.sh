@@ -350,27 +350,109 @@ print(json.dumps(log, indent=2))
 }
 
 # Fetch album art and save to status directory
+# Tries multiple sources: MusicBrainz CAA, CAA release-group, iTunes, Deezer
 fetch_album_art() {
     local artist="$1"
     local album="$2"
+    local dest="$STATUS_DIR/cover-$(basename "$DEVICE").jpg"
     if command -v python3 >/dev/null 2>&1; then
         python3 -c "
-import urllib.request, urllib.parse, json, sys
+import urllib.request, urllib.parse, json, sys, time
+
+artist, album, dest = sys.argv[1], sys.argv[2], sys.argv[3]
+ua = 'autorip/1.0 (https://github.com/boylermb/autorip)'
+
+def download(url, target):
+    req = urllib.request.Request(url, headers={'User-Agent': ua})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = resp.read()
+        if len(data) < 1000:
+            return False  # too small, probably an error page
+        with open(target, 'wb') as f:
+            f.write(data)
+    return True
+
+# --- Method 1: MusicBrainz Cover Art Archive (release) ---
 try:
-    query = urllib.parse.quote(f'artist:\"{sys.argv[1]}\" AND release:\"{sys.argv[2]}\"')
-    url = f'https://musicbrainz.org/ws/2/release/?query={query}&fmt=json&limit=1'
-    req = urllib.request.Request(url, headers={'User-Agent': 'autorip/1.0'})
+    query = urllib.parse.quote(f'artist:\"{artist}\" AND release:\"{album}\"')
+    url = f'https://musicbrainz.org/ws/2/release/?query={query}&fmt=json&limit=5'
+    req = urllib.request.Request(url, headers={'User-Agent': ua})
     resp = urllib.request.urlopen(req, timeout=10)
     data = json.loads(resp.read())
     releases = data.get('releases', [])
-    if releases:
-        mbid = releases[0]['id']
-        art_url = f'https://coverartarchive.org/release/{mbid}/front-250'
-        urllib.request.urlretrieve(art_url, sys.argv[3])
-        print('OK')
+    for rel in releases:
+        mbid = rel['id']
+        try:
+            if download(f'https://coverartarchive.org/release/{mbid}/front-250', dest):
+                print(f'OK: CAA release {mbid}')
+                sys.exit(0)
+        except Exception:
+            continue
 except Exception as e:
-    print(f'FAIL: {e}', file=sys.stderr)
-" "$artist" "$album" "$STATUS_DIR/cover-$(basename "$DEVICE").jpg" 2>/dev/null || true
+    print(f'CAA release failed: {e}', file=sys.stderr)
+
+time.sleep(0.5)
+
+# --- Method 2: MusicBrainz Cover Art Archive (release-group) ---
+try:
+    query = urllib.parse.quote(f'artist:\"{artist}\" AND releasegroup:\"{album}\"')
+    url = f'https://musicbrainz.org/ws/2/release-group/?query={query}&fmt=json&limit=3'
+    req = urllib.request.Request(url, headers={'User-Agent': ua})
+    resp = urllib.request.urlopen(req, timeout=10)
+    data = json.loads(resp.read())
+    rgs = data.get('release-groups', [])
+    for rg in rgs:
+        rgid = rg['id']
+        try:
+            if download(f'https://coverartarchive.org/release-group/{rgid}/front-250', dest):
+                print(f'OK: CAA release-group {rgid}')
+                sys.exit(0)
+        except Exception:
+            continue
+except Exception as e:
+    print(f'CAA release-group failed: {e}', file=sys.stderr)
+
+time.sleep(0.5)
+
+# --- Method 3: iTunes Search API ---
+try:
+    term = urllib.parse.quote(f'{artist} {album}')
+    url = f'https://itunes.apple.com/search?term={term}&media=music&entity=album&limit=5'
+    req = urllib.request.Request(url, headers={'User-Agent': ua})
+    resp = urllib.request.urlopen(req, timeout=10)
+    data = json.loads(resp.read())
+    for result in data.get('results', []):
+        art_url = result.get('artworkUrl100', '')
+        if art_url:
+            # Get higher resolution (600x600)
+            art_url = art_url.replace('100x100bb', '600x600bb')
+            if download(art_url, dest):
+                print(f'OK: iTunes ({result.get(\"collectionName\", \"?\")})')
+                sys.exit(0)
+except Exception as e:
+    print(f'iTunes failed: {e}', file=sys.stderr)
+
+time.sleep(0.5)
+
+# --- Method 4: Deezer API ---
+try:
+    term = urllib.parse.quote(f'{artist} {album}')
+    url = f'https://api.deezer.com/search/album?q={term}&limit=5'
+    req = urllib.request.Request(url, headers={'User-Agent': ua})
+    resp = urllib.request.urlopen(req, timeout=10)
+    data = json.loads(resp.read())
+    for result in data.get('data', []):
+        art_url = result.get('cover_big', '') or result.get('cover_medium', '')
+        if art_url:
+            if download(art_url, dest):
+                print(f'OK: Deezer ({result.get(\"title\", \"?\")})')
+                sys.exit(0)
+except Exception as e:
+    print(f'Deezer failed: {e}', file=sys.stderr)
+
+print('No cover art found from any source', file=sys.stderr)
+sys.exit(1)
+" "$artist" "$album" "$dest" 2>/dev/null || true
     fi
 }
 
