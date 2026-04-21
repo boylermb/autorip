@@ -224,8 +224,8 @@ nothing reaches `Video/TV/`.
 | 5 | Add show-name canonicalization + `_unmatched/` routing | S | low | ✅ done | Disc with garbage label lands in `_unmatched/`, not in `Video/TV/Sp1/` |
 | 6 | Add `tv-overrides.yml` support | S | low | ✅ done (JSON, not YAML — no PyYAML dep) | Override file with one entry produces the overridden naming |
 | 7 | Add production-vs-aired mismatch detection + `_pending/` routing | M | medium (needs runtime-comparison heuristic tuning) | ✅ done | A box set known to be production-order routes to `_pending/` |
-| 8 | media-review UI: `_unmatched/` + `_pending/` tabs | M | low | ⏳ next | Web UI exposes both buckets; user can move files into final naming |
-| 9 | Backfill: re-process existing TV directories that have no `poster.jpg` | S | none (read-only against TMDb; only writes artwork files) | | All `Video/TV/<Show>/` have `poster.jpg` |
+| 8 | media-review UI: `_unmatched/` + `_pending/` tabs | M | low | ✅ done | Web UI exposes both buckets via `bucket` field on `/api/items`; cards get badges + contextual banners; pending cards render `episodes-plan.txt` inline |
+| 9 | Backfill: re-process existing TV directories that have no `poster.jpg` | S | none (read-only against TMDb; only writes artwork files) | ✅ done | `bin/backfill-tv-artwork.sh --library /srv/library/Video/TV --apply` fills missing poster.jpg, tvshow.nfo, season-poster.jpg; idempotent; 14 unit tests |
 
 Each step is an independent commit. Steps 1, 2, 4, 5, 6, 9 are the
 high-value/low-risk core. Steps 3, 7, 8 are the bigger bets.

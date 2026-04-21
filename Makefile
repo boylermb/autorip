@@ -157,6 +157,7 @@ install-agent:
 install-worker: configure-services
 	@echo "==> Installing GPU transcode worker..."
 	install -m 0755 bin/transcode-worker.sh $(PREFIX)/bin/transcode-worker.sh
+	install -m 0755 bin/backfill-tv-artwork.sh $(PREFIX)/bin/backfill-tv-artwork.sh
 	@# Shared shell libraries (in case install-scripts wasn't run on this node)
 	mkdir -p $(PREFIX)/lib/autorip
 	install -m 0644 bin/lib/tmdb.sh $(PREFIX)/lib/autorip/tmdb.sh
@@ -203,6 +204,7 @@ uninstall:
 	-systemctl disable autorip-agent transcode-worker.timer 2>/dev/null || true
 	rm -f $(PREFIX)/bin/autorip.sh
 	rm -f $(PREFIX)/bin/transcode-worker.sh
+	rm -f $(PREFIX)/bin/backfill-tv-artwork.sh
 	rm -rf $(PREFIX)/lib/autorip
 	rm -f $(SYSTEMDDIR)/autorip@.service
 	rm -f $(SYSTEMDDIR)/transcode-worker.service
