@@ -521,8 +521,12 @@ def review_jobs():
             data["item_path"] = rel_path
             # List media files in the directory
             media_files = []
+            sidecar_names = {
+                "metadata.json", "episodes-plan.txt",
+                "cover.jpg", "cover.png", "folder.jpg",
+            }
             for fname in sorted(files):
-                if fname == "metadata.json":
+                if fname in sidecar_names:
                     continue
                 fpath = os.path.join(root, fname)
                 try:
@@ -541,6 +545,24 @@ def review_jobs():
                     has_art = art_name
                     break
             data["has_art"] = has_art
+            # Bucket hint for review UI: _unmatched/ and _pending/ items
+            # produced by the TV worker get parked under those subtrees and
+            # should surface in dedicated tabs.
+            if "/_unmatched/" in ("/" + rel_path + "/"):
+                data["bucket"] = "unmatched"
+            elif "/_pending/" in ("/" + rel_path + "/"):
+                data["bucket"] = "pending"
+            else:
+                data["bucket"] = "normal"
+            # Include episodes-plan.txt content (small, written by worker
+            # alongside _pending/ items) so the UI can show it inline.
+            plan_path = os.path.join(root, "episodes-plan.txt")
+            if os.path.isfile(plan_path):
+                try:
+                    with open(plan_path, "r") as pf:
+                        data["plan_text"] = pf.read()
+                except OSError:
+                    pass
             jobs.append(data)
         except (json.JSONDecodeError, OSError):
             jobs.append({"item_path": rel_path, "error": "unreadable"})
