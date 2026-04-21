@@ -34,7 +34,7 @@ if [ "$(ffprobe -v error -show_entries format=duration -of default=nokey=1 "$TMP
 fi
 
 # Create stub mkv files (just need them to exist for [ -f ] check)
-for m in 22 22 22 22 45 90; do
+for m in 9 22 22 22 22 24 25 45 47 48 90; do
     : > "$TMPDIR/ep_${m}.mkv"
 done
 
@@ -67,7 +67,9 @@ tv_check_runtime_match 1 \
     "$TMPDIR/ep_22.mkv" "$TMPDIR/ep_22.mkv" "$TMPDIR/ep_22.mkv" "$TMPDIR/ep_22.mkv"
 check "all-match disc: not flagged"  ""  "$TV_RUNTIME_MISMATCH"
 
-# ---------- Test 2: 4 episodes but 3 of them are way off (45 vs 22)
+# ---------- Test 2: 4 titles where the last 3 are 2x the TMDb runtime.
+# Under the new semantics these are runtime-outliers → classified as
+# EXTRAS, not mismatches.  Disc is not flagged for review.
 reset_tmdb
 TMDB_EP_RUNTIMES[1]=22; TMDB_EP_NAMES[1]="Aired-1"
 TMDB_EP_RUNTIMES[2]=22; TMDB_EP_NAMES[2]="Aired-2"
@@ -76,11 +78,11 @@ TMDB_EP_RUNTIMES[4]=22; TMDB_EP_NAMES[4]="Aired-4"
 TV_RUNTIME_MISMATCH=""; TV_RUNTIME_PLAN=""
 tv_check_runtime_match 1 \
     "$TMPDIR/ep_22.mkv" "$TMPDIR/ep_45.mkv" "$TMPDIR/ep_45.mkv" "$TMPDIR/ep_45.mkv"
-check "3-of-4 mismatched: flagged"   "1"  "$TV_RUNTIME_MISMATCH"
-
-# Plan should mention MISMATCH at least 3 times
-mismatch_count=$(echo "$TV_RUNTIME_PLAN" | grep -c "MISMATCH" || true)
-check "plan: 3 MISMATCH rows"        "3"  "$mismatch_count"
+check "3-of-4 are 2x runtime: classed as EXTRA, disc not flagged"  ""  "$TV_RUNTIME_MISMATCH"
+extra_count=$(echo "$TV_RUNTIME_PLAN" | grep -c "EXTRA" || true)
+check "plan: 3 EXTRA rows"        "3"  "$extra_count"
+check "verdicts[2]=extra"        "extra" "$(tv_runtime_verdict 2)"
+check "verdicts[1] empty"        ""      "$(tv_runtime_verdict 1)"
 
 # ---------- Test 3: only 1 mismatched out of 4 — not flagged (under threshold)
 reset_tmdb
@@ -89,15 +91,16 @@ TMDB_EP_RUNTIMES[3]=22; TMDB_EP_RUNTIMES[4]=22
 TV_RUNTIME_MISMATCH=""; TV_RUNTIME_PLAN=""
 tv_check_runtime_match 1 \
     "$TMPDIR/ep_22.mkv" "$TMPDIR/ep_22.mkv" "$TMPDIR/ep_45.mkv" "$TMPDIR/ep_22.mkv"
-check "1-of-4 mismatched: not flagged" "" "$TV_RUNTIME_MISMATCH"
+check "1-of-4 outlier: not flagged"  "" "$TV_RUNTIME_MISMATCH"
 
-# ---------- Test 4: short disc (2 episodes), 1 mismatch — flagged via
-# trigger=checked-1=1 logic
+# ---------- Test 4: short disc (2 titles), 1 is 4x runtime — that title
+# becomes an EXTRA, disc not flagged for review.
 reset_tmdb
 TMDB_EP_RUNTIMES[5]=22; TMDB_EP_RUNTIMES[6]=22
 TV_RUNTIME_MISMATCH=""; TV_RUNTIME_PLAN=""
 tv_check_runtime_match 5 "$TMPDIR/ep_22.mkv" "$TMPDIR/ep_90.mkv"
-check "2-ep disc, 1 mismatch: flagged" "1" "$TV_RUNTIME_MISMATCH"
+check "2-title disc, 1 outlier: not flagged"  "" "$TV_RUNTIME_MISMATCH"
+check "2-title disc: title 2 is extra"   "extra" "$(tv_runtime_verdict 2)"
 
 # ---------- Test 5: TMDb runtimes empty — silent no-op
 reset_tmdb
@@ -119,6 +122,51 @@ tv_check_runtime_match 1 \
 # show "no-tmdb-runtime"
 check "missing TMDb data: not flagged" "" "$TV_RUNTIME_MISMATCH"
 check "missing TMDb data: row marked"  "1" "$(echo "$TV_RUNTIME_PLAN" | grep -c 'no-tmdb-runtime' || true)"
+
+# ---------- Test 7: Murder, She Wrote pattern — 4 real eps (~47m) + 1
+# bonus feature (9m).  Bonus must be flagged "extra"; episodes pass.
+reset_tmdb
+TMDB_EP_RUNTIMES[1]=47; TMDB_EP_NAMES[1]="Pilot"
+TMDB_EP_RUNTIMES[2]=47; TMDB_EP_NAMES[2]="Deadly Lady"
+TMDB_EP_RUNTIMES[3]=48; TMDB_EP_NAMES[3]="Birds"
+TMDB_EP_RUNTIMES[4]=48; TMDB_EP_NAMES[4]="Hooray"
+TV_RUNTIME_MISMATCH=""; TV_RUNTIME_PLAN=""
+tv_check_runtime_match 1 \
+    "$TMPDIR/ep_47.mkv" "$TMPDIR/ep_48.mkv" "$TMPDIR/ep_47.mkv" \
+    "$TMPDIR/ep_48.mkv" "$TMPDIR/ep_9.mkv"
+check "MSW pattern: not flagged"        ""      "$TV_RUNTIME_MISMATCH"
+check "MSW pattern: title 5 is extra"   "extra" "$(tv_runtime_verdict 5)"
+check "MSW pattern: title 1 is episode" ""      "$(tv_runtime_verdict 1)"
+check "MSW pattern: 1 EXTRA row"        "1"     "$(echo "$TV_RUNTIME_PLAN" | grep -c 'EXTRA' || true)"
+
+# ---------- Test 8: real prod-vs-aired order — runtimes within band
+# but each title maps to the wrong TMDb episode.  Should still flag as
+# MISMATCH because all titles fall inside the season band (not extras)
+# but their durations don't line up with planned episodes.
+reset_tmdb
+# TMDb says S1 mixes long premieres/finales with regular eps
+TMDB_EP_RUNTIMES[1]=45; TMDB_EP_NAMES[1]="Aired-1 (long premiere)"
+TMDB_EP_RUNTIMES[2]=22; TMDB_EP_NAMES[2]="Aired-2"
+TMDB_EP_RUNTIMES[3]=22; TMDB_EP_NAMES[3]="Aired-3"
+TMDB_EP_RUNTIMES[4]=22; TMDB_EP_NAMES[4]="Aired-4"
+TMDB_EP_RUNTIMES[5]=45; TMDB_EP_NAMES[5]="Aired-5 (long finale)"
+# Disc is in production order: long eps first, regulars after.  All
+# durations are within the season band (22..45) so none are extras —
+# but ≥3 titles map to the wrong planned ep, producing mismatches.
+TV_RUNTIME_MISMATCH=""; TV_RUNTIME_PLAN=""
+tv_check_runtime_match 1 \
+    "$TMPDIR/ep_45.mkv" "$TMPDIR/ep_45.mkv" "$TMPDIR/ep_22.mkv" \
+    "$TMPDIR/ep_22.mkv" "$TMPDIR/ep_22.mkv"
+# title 2 (45m) vs planned 22m → mismatch
+# title 5 (22m) vs planned 45m → mismatch
+# title 1 (45m) vs planned 45m → ok
+# titles 3,4 (22m) vs planned 22m → ok
+# Only 2 mismatches out of 5 — under the default threshold of 3, so
+# NOT flagged.  This documents a known limitation: the runtime check
+# only catches *systematic* prod-order discs, not isolated swaps.
+mismatch_rows=$(echo "$TV_RUNTIME_PLAN" | grep -c 'MISMATCH' || true)
+check "prod-order disc: 2 MISMATCH rows recorded" "1" "$([ "$mismatch_rows" -ge 2 ] && echo 1 || echo 0)"
+check "prod-order disc: no extras"                ""  "$(tv_runtime_verdict 1)"
 
 echo
 echo "Results: $pass passed, $fail failed"

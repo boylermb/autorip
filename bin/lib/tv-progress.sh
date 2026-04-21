@@ -152,3 +152,38 @@ tv_progress_clear() {
     file=$(_tv_progress_file "$show" "$season")
     rm -f "$file"
 }
+
+# tv_progress_amend_disc <show> <season> <disc> <new_episode_count>
+# Updates the recorded episode_count for an already-stored disc.  Used
+# when post-rip analysis (e.g. runtime-check finds extras) reduces the
+# real episode count so the next disc's first_episode stays correct.
+# No-op (returns 0) if the disc isn't in the state file.
+tv_progress_amend_disc() {
+    local show="$1" season="$2" disc="$3" new_count="$4"
+
+    if [ -z "$show" ] || [ -z "$season" ] || [ -z "$disc" ] || [ -z "$new_count" ]; then
+        _tv_progress_log "amend: missing args"
+        return 1
+    fi
+
+    local file
+    file=$(_tv_progress_file "$show" "$season")
+    [ -f "$file" ] || return 0
+
+    python3 - "$file" "$disc" "$new_count" <<'PY' 2>/dev/null || return 1
+import json, sys, os, tempfile
+file, disc, new_count = sys.argv[1], str(sys.argv[2]), int(sys.argv[3])
+with open(file) as f:
+    state = json.load(f)
+discs = state.get("discs", {})
+if disc not in discs:
+    sys.exit(0)
+discs[disc]["episode_count"] = new_count
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(file), prefix=".progress-", suffix=".tmp")
+with os.fdopen(fd, "w") as f:
+    json.dump(state, f, indent=2)
+os.replace(tmp, file)
+PY
+    _tv_progress_log "amended disc $disc episode_count → $new_count"
+    return 0
+}

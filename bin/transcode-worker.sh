@@ -410,6 +410,25 @@ tv_rename_file() {
         return 0
     fi
 
+    # Per-title classification from the runtime check (if it ran).
+    # An "extra" is a title whose runtime falls well outside the
+    # season's normal episode-runtime band — bonus features, behind-
+    # the-scenes, etc.  Route these to <Show>/Extras/ with their
+    # original basename instead of consuming an SxxEyy slot.
+    local title_verdict=""
+    if declare -F tv_runtime_verdict >/dev/null 2>&1; then
+        title_verdict=$(tv_runtime_verdict "$title_index")
+    fi
+    if [ "$title_verdict" = "extra" ]; then
+        local extras_dir="$UNREVIEWED_TV/$TV_SHOW/Extras"
+        mkdir -p "$extras_dir"
+        local base
+        base=$(basename "$mkv")
+        mv -f "$mkv" "$extras_dir/$base"
+        log "TV extra (runtime outside season band): $(basename "$mkv") → $extras_dir/"
+        return 0
+    fi
+
     # Pending-review fallback: TMDb runtimes disagree with actual file
     # durations.  Park under _pending/ with the proposed-name suffix so a
     # human can compare to the episodes-plan.txt sitting alongside.
@@ -431,11 +450,24 @@ tv_rename_file() {
 
     # Episode number: prefer per-show progress state (TV_FIRST_EPISODE set by
     # the disc handler); fall back to legacy global-config math if unset.
+    # Subtract any earlier titles on this disc that were classified as
+    # extras so the episode counter stays continuous.
+    local extras_before=0
+    if declare -F tv_runtime_verdict >/dev/null 2>&1; then
+        local _i
+        for (( _i=1; _i<title_index; _i++ )); do
+            if [ "$(tv_runtime_verdict "$_i")" = "extra" ]; then
+                extras_before=$(( extras_before + 1 ))
+            fi
+        done
+    fi
+    local effective_index=$(( title_index - extras_before ))
+
     local ep_num
     if [ -n "${TV_FIRST_EPISODE:-}" ]; then
-        ep_num=$(( TV_FIRST_EPISODE + title_index - 1 ))
+        ep_num=$(( TV_FIRST_EPISODE + effective_index - 1 ))
     else
-        ep_num=$(( (TV_DISC - 1) * EPISODES_PER_DISC + title_index ))
+        ep_num=$(( (TV_DISC - 1) * EPISODES_PER_DISC + effective_index ))
     fi
     local ep_name
 
@@ -1058,6 +1090,29 @@ process_job() {
             movie_rename_file "$fp" "$disc_title"
         fi
     done
+
+    # If any titles on this TV disc were classified as runtime-outlier
+    # extras and routed to <Show>/Extras/, the recorded episode_count
+    # for this disc (set earlier by tv_progress_for_disc using the raw
+    # title count) overcounts.  Amend it so the next disc starts at the
+    # correct episode number.
+    if [ -n "$IS_TV_DISC" ] \
+       && [ -z "$TV_UNMATCHED" ] && [ -z "$TV_PENDING" ] \
+       && [ -n "$TV_FIRST_EPISODE" ] \
+       && declare -F tv_runtime_verdict >/dev/null 2>&1 \
+       && declare -F tv_progress_amend_disc >/dev/null 2>&1; then
+        local _extras=0 _i
+        for (( _i=1; _i<=${#file_paths[@]}; _i++ )); do
+            if [ "$(tv_runtime_verdict "$_i")" = "extra" ]; then
+                _extras=$(( _extras + 1 ))
+            fi
+        done
+        if [ "$_extras" -gt 0 ]; then
+            local _real=$(( ${#file_paths[@]} - _extras ))
+            log "TV: $_extras title(s) routed to Extras/; amending disc $TV_DISC episode_count → $_real"
+            tv_progress_amend_disc "$TV_SHOW" "$TV_SEASON" "$TV_DISC" "$_real" || true
+        fi
+    fi
 
     # Determine the unreviewed output directory for metadata.json
     local unreviewed_dest=""
