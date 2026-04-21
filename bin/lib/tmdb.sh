@@ -307,3 +307,48 @@ tmdb_load_show() {
     tmdb_fetch_season_images "$TMDB_SHOW_ID" "$season" || true
     return 0
 }
+
+# Fetch show details by TMDb ID (no search).  Use this when an override
+# pins a specific TMDb id, to skip the fuzzy search entirely.
+# Sets TMDB_SHOW_ID, TMDB_SHOW_NAME.  Returns 0 on success.
+tmdb_get_show_by_id() {
+    local show_id="$1"
+    [ -n "$show_id" ] || return 1
+    # Reject non-numeric ids
+    case "$show_id" in
+        ''|*[!0-9]*) _tmdb_log "invalid TMDb id '$show_id'"; return 1 ;;
+    esac
+
+    TMDB_SHOW_ID=""
+    TMDB_SHOW_NAME=""
+
+    local response
+    response=$(_tmdb_curl "/tv/${show_id}") || {
+        _tmdb_log "show-by-id API call failed for $show_id"
+        return 1
+    }
+
+    local parsed
+    parsed=$(printf '%s' "$response" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+sid = d.get('id')
+name = d.get('name', '')
+if not sid:
+    sys.exit(1)
+print(f'{sid}::{name}')
+" 2>/dev/null) || {
+        _tmdb_log "no show found for id $show_id"
+        return 1
+    }
+
+    TMDB_SHOW_ID="${parsed%%::*}"
+    TMDB_SHOW_NAME="${parsed#*::}"
+    # Backfill the search cache so subsequent searches by name are no-ops
+    _TMDB_SEARCH_CACHE[$TMDB_SHOW_NAME]="$parsed"
+    _tmdb_log "loaded by id: $TMDB_SHOW_ID → '$TMDB_SHOW_NAME'"
+    return 0
+}

@@ -57,8 +57,12 @@ for _libdir in /usr/local/lib/autorip "$_SELF_DIR/lib"; do
         # shellcheck source=lib/tv-progress.sh
         source "$_libdir/tv-progress.sh"
     fi
+    if [ -f "$_libdir/tv-overrides.sh" ]; then
+        # shellcheck source=lib/tv-overrides.sh
+        source "$_libdir/tv-overrides.sh"
+    fi
     # Stop after the first directory that had at least one library
-    if [ -f "$_libdir/tmdb.sh" ] || [ -f "$_libdir/tv-progress.sh" ]; then
+    if [ -f "$_libdir/tmdb.sh" ] || [ -f "$_libdir/tv-progress.sh" ] || [ -f "$_libdir/tv-overrides.sh" ]; then
         break
     fi
 done
@@ -893,12 +897,44 @@ process_job() {
     if parse_tv_disc_title "$disc_title"; then
         IS_TV_DISC=1
         local _raw_show="$TV_SHOW"
-        if canonicalize_tv_show "$_raw_show"; then
-            if [ "$TV_SHOW_CANONICAL" != "$_raw_show" ]; then
-                log "TV: canonicalized show name '$_raw_show' → '$TV_SHOW_CANONICAL' (TMDb id $TV_SHOW_TMDB_ID)"
-            fi
-            TV_SHOW="$TV_SHOW_CANONICAL"
 
+        # Check overrides FIRST. They can either:
+        #   - force a specific TMDb id (skips fuzzy search entirely)
+        #   - rewrite the show name before canonicalize_tv_show runs
+        local _matched=""
+        if declare -F tv_apply_overrides >/dev/null 2>&1 \
+           && tv_apply_overrides "$_raw_show" "$disc_title"; then
+            if [ -n "$TV_OVERRIDE_TMDB_ID" ] && declare -F tmdb_get_show_by_id >/dev/null 2>&1; then
+                if tmdb_get_show_by_id "$TV_OVERRIDE_TMDB_ID"; then
+                    TV_SHOW="${TV_OVERRIDE_SHOW:-$TMDB_SHOW_NAME}"
+                    log "TV: override pinned TMDb id $TV_OVERRIDE_TMDB_ID → '$TV_SHOW'"
+                    _matched=1
+                else
+                    log "TV: override TMDb id $TV_OVERRIDE_TMDB_ID failed to load; falling back to search"
+                fi
+            fi
+            # Name override but no id (or id failed) — feed override name into canonicalize
+            if [ -z "$_matched" ] && [ -n "$TV_OVERRIDE_SHOW" ]; then
+                if canonicalize_tv_show "$TV_OVERRIDE_SHOW"; then
+                    TV_SHOW="$TV_SHOW_CANONICAL"
+                    log "TV: override name '$TV_OVERRIDE_SHOW' → canonical '$TV_SHOW' (TMDb id $TV_SHOW_TMDB_ID)"
+                    _matched=1
+                fi
+            fi
+        fi
+
+        # No override (or override failed): try canonicalize on the raw name
+        if [ -z "$_matched" ]; then
+            if canonicalize_tv_show "$_raw_show"; then
+                if [ "$TV_SHOW_CANONICAL" != "$_raw_show" ]; then
+                    log "TV: canonicalized show name '$_raw_show' → '$TV_SHOW_CANONICAL' (TMDb id $TV_SHOW_TMDB_ID)"
+                fi
+                TV_SHOW="$TV_SHOW_CANONICAL"
+                _matched=1
+            fi
+        fi
+
+        if [ -n "$_matched" ]; then
             fetch_tv_artwork "$TV_SHOW" "$TV_SEASON" || true
 
             if declare -F tv_progress_for_disc >/dev/null 2>&1 \
@@ -913,7 +949,7 @@ process_job() {
                 log "TV: progress lib unavailable, using legacy math (first episode = E$(printf '%02d' "$TV_FIRST_EPISODE"))"
             fi
         else
-            log "TV: could not match show '$_raw_show' on TMDb — routing disc to _unmatched/"
+            log "TV: could not match show '$_raw_show' on TMDb (no override available) — routing disc to _unmatched/"
             TV_UNMATCHED=1
             TV_UNMATCHED_LABEL="$disc_title"
         fi

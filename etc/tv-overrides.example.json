@@ -1,0 +1,17 @@
+{
+  "_comment": "Example tv-overrides.json. Install at /etc/autorip/tv-overrides.json (or override path with TV_OVERRIDES_FILE).  See bin/lib/tv-overrides.sh for the full schema.",
+
+  "shows": {
+    "_comment": "Keys are lowercase show names matched after parse_tv_disc_title and after label_rewrites are applied.  Each entry may set 'tmdb_id' (forces an exact TMDb show, skips fuzzy search) and/or 'name' (overrides the canonical name used in the file path).",
+
+    "the sopranos":   {"tmdb_id": 1398, "name": "The Sopranos"},
+    "futurama":       {"tmdb_id": 615}
+  },
+
+  "label_rewrites": [
+    {"_comment": "Patterns are regex, matched case-insensitively against the FULL raw disc title (e.g. 'SP1_S1D1').  First match wins.  'show' replaces only the show portion."},
+
+    {"pattern": "^SP[0-9]+_",     "show": "Star Trek The Original Series"},
+    {"pattern": "^TOS_",          "show": "Star Trek"}
+  ]
+}
