@@ -1356,6 +1356,29 @@ def _fetch_tmdb_season(show_id, season_num, api_key):
     return names, data
 
 
+def _search_tmdb_show_id(show_name, api_key):
+    """Search TMDb for a show by name; return the top-result id (str) or None."""
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+    if not show_name:
+        return None
+    api_url = (
+        "https://api.themoviedb.org/3/search/tv"
+        f"?api_key={api_key}&query={urllib.parse.quote(show_name)}"
+    )
+    req = urllib.request.Request(api_url, headers={"User-Agent": "autorip/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
+        return None
+    results = data.get("results") or []
+    if not results:
+        return None
+    return str(results[0].get("id") or "") or None
+
+
 @app.route("/review/tv-renumber", methods=["POST"])
 def review_tv_renumber():
     """Manually renumber TV episode files in an unreviewed item.
@@ -1433,6 +1456,10 @@ def review_tv_renumber():
         return jsonify({"error": "Could not determine show or season; pass them explicitly"}), 400
 
     # Optionally fetch TMDb episode names for friendlier filenames.
+    # Resolution order for the show id:
+    #   1. ?tmdb_url= in the request
+    #   2. metadata.tmdb_id / metadata.tv_show_tmdb_id (stamped by worker)
+    #   3. TMDb search by show name (so the UI button works without any URL)
     ep_names = {}
     tmdb_url = (payload.get("tmdb_url") or "").strip()
     show_id = None
@@ -1441,12 +1468,15 @@ def review_tv_renumber():
         if m:
             show_id = m.group(1)
     show_id = show_id or str(metadata.get("tmdb_id") or metadata.get("tv_show_tmdb_id") or "")
+    api_key = (
+        _config.get("TMDB_API_KEY")
+        or os.environ.get("TMDB_API_KEY")
+        or "db972a607f2760bb19ff8bb34074b4c7"
+    )
+    if not show_id:
+        show_id = _search_tmdb_show_id(show, api_key)
+    tmdb_lookup_attempted = bool(show_id)
     if show_id:
-        api_key = (
-            _config.get("TMDB_API_KEY")
-            or os.environ.get("TMDB_API_KEY")
-            or "db972a607f2760bb19ff8bb34074b4c7"
-        )
         ep_names, _ = _fetch_tmdb_season(show_id, season, api_key)
         ep_names = ep_names or {}
 
@@ -1466,13 +1496,26 @@ def review_tv_renumber():
     if not mkvs:
         return jsonify({"error": "No .mkv files found in item"}), 404
 
+    # Detect whether we are actually shifting numbers. If we are, the existing
+    # " - <title>" suffix in the filename refers to the OLD episode number and
+    # is therefore stale — drop it. Only preserve the suffix if the user is
+    # essentially re-stamping with the same starting episode (e.g. fixing the
+    # show name without changing numbers).
+    def _existing_first_ep():
+        m = sxxeyy_re.search(mkvs[0])
+        return int(m.group(2)) if m else None
+
+    is_shift = _existing_first_ep() != first_ep
+    safe_show = re.sub(r'[<>:"/\\|?*]', "_", show).strip()
+
     # Two-pass rename to avoid name collisions when shifting episode numbers.
     pending = []
+    missing_titles = []
     for i, fname in enumerate(mkvs):
         new_ep = first_ep + i
         ep_title = ep_names.get(new_ep)
-        if not ep_title:
-            # Try to preserve an existing " - <title>" suffix from the old name
+        if not ep_title and not is_shift:
+            # Same numbering — old suffix is still valid, keep it
             tail = re.match(
                 r"^.*S\d{2}E\d{2}\s*-\s*(.+)\.mkv$",
                 fname,
@@ -1480,13 +1523,12 @@ def review_tv_renumber():
             )
             if tail:
                 ep_title = tail.group(1).strip()
-        # Sanitize for filesystem
-        safe_show = re.sub(r'[<>:"/\\|?*]', "_", show).strip()
         if ep_title:
             safe_title = re.sub(r'[<>:"/\\|?*]', "_", ep_title).strip()
             new_name = f"{safe_show} - S{int(season):02d}E{new_ep:02d} - {safe_title}.mkv"
         else:
             new_name = f"{safe_show} - S{int(season):02d}E{new_ep:02d}.mkv"
+            missing_titles.append(new_ep)
         pending.append((fname, new_name))
 
     # Stage via .renumber- prefix to dodge collisions, then move into place.
@@ -1551,6 +1593,9 @@ def review_tv_renumber():
         "ok": True,
         "message": (
             f"Renumbered {len(renamed)} file(s) starting at S{int(season):02d}E{first_ep:02d}"
+            + (f" with TMDb titles" if ep_names else
+               (" — TMDb lookup found no titles, used numeric names" if tmdb_lookup_attempted else
+                " — no TMDb id known; used numeric names"))
             + (f"; recorded disc {disc} in progress state" if disc and progress_path
                and not str(progress_path).startswith("<failed") else "")
         ),
@@ -1560,6 +1605,8 @@ def review_tv_renumber():
         "first_episode": first_ep,
         "renamed_files": renamed,
         "tmdb_titles_used": bool(ep_names),
+        "tmdb_lookup_attempted": tmdb_lookup_attempted,
+        "missing_titles_for": missing_titles,
         "progress_state_path": progress_path,
     })
 
