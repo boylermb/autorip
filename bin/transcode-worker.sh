@@ -322,10 +322,86 @@ tmdb_fetch_season_by_name() {
     return 0
 }
 
+# ---------- Show-name canonicalization ----------
+# Given a raw show name parsed from a disc label (e.g. "Sopranos The",
+# "Sp1", "Futurama Vol2"), try to resolve it to a TMDb-known canonical
+# title. On success, sets:
+#   TV_SHOW_CANONICAL = TMDb's canonical name (e.g. "The Sopranos")
+#   TV_SHOW_TMDB_ID   = TMDb show id
+#   returns 0
+# On failure (no library, no hits on any variant), leaves both empty
+# and returns 1. The caller should treat failure as "route to _unmatched/".
+#
+# Variants tried, in order:
+#   1. raw input
+#   2. with trailing "Vol N" / "Volume N" / "Disc N" / "Box N" stripped
+#   3. with leading "The " moved to the end ("Sopranos The" -> "The Sopranos")
+#   4. with the trailing "The" moved to the front
+#   5. collapsed-whitespace, single-word inputs >=4 chars only (skip "Sp1")
+canonicalize_tv_show() {
+    local raw="$1"
+    TV_SHOW_CANONICAL=""
+    TV_SHOW_TMDB_ID=""
+
+    if ! declare -F tmdb_search_show >/dev/null 2>&1; then
+        return 1
+    fi
+
+    # Build variants
+    local -a variants=()
+    variants+=( "$raw" )
+
+    local stripped
+    stripped=$(echo "$raw" | sed -E 's/[[:space:]]+(Vol(ume)?|Disc|Box)[[:space:]]*[0-9]+$//I')
+    [ "$stripped" != "$raw" ] && variants+=( "$stripped" )
+
+    if echo "$raw" | grep -qiE '^The[[:space:]]'; then
+        variants+=( "$(echo "$raw" | sed -E 's/^[Tt]he[[:space:]]+(.*)$/\1, The/')" )
+    fi
+    if echo "$raw" | grep -qiE '[[:space:]]The$'; then
+        variants+=( "The $(echo "$raw" | sed -E 's/[[:space:]]+[Tt]he$//')" )
+    fi
+
+    local v
+    for v in "${variants[@]}"; do
+        # Skip junk: empty, single short word, or all-digits
+        [ -z "$v" ] && continue
+        local word_count
+        word_count=$(echo "$v" | wc -w | tr -d ' ')
+        if [ "$word_count" -eq 1 ] && [ "${#v}" -lt 4 ]; then
+            continue
+        fi
+        if echo "$v" | grep -qE '^[0-9]+$'; then
+            continue
+        fi
+
+        if tmdb_search_show "$v" 2>/dev/null && [ -n "${TMDB_SHOW_ID:-}" ]; then
+            TV_SHOW_CANONICAL="${TMDB_SHOW_NAME:-$v}"
+            TV_SHOW_TMDB_ID="$TMDB_SHOW_ID"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 # ---------- TV rename (single file) ----------
 tv_rename_file() {
     local mkv="$1"
     local title_index="$2"   # 1-indexed
+
+    # Unmatched-show fallback: park files under _unmatched/<raw_disc_label>/
+    # with the original basename so a human can identify them later.
+    if [ -n "${TV_UNMATCHED:-}" ] && [ -n "${TV_UNMATCHED_LABEL:-}" ]; then
+        local unmatched_dir="$UNREVIEWED_TV/_unmatched/$TV_UNMATCHED_LABEL"
+        mkdir -p "$unmatched_dir"
+        local base
+        base=$(basename "$mkv")
+        mv -f "$mkv" "$unmatched_dir/$base"
+        log "Unmatched TV disc: moved $base → $unmatched_dir/"
+        return 0
+    fi
+
     local season_dir
     season_dir=$(printf "Season %02d" "$TV_SEASON")
     local dest_dir="$UNREVIEWED_TV/$TV_SHOW/$season_dir"
@@ -805,23 +881,41 @@ process_job() {
 
     log "Processing disc: $disc_title (${#file_paths[@]} title(s), from $source_host)"
 
-    # Per-disc TV setup (artwork + episode-numbering state).
+    # Per-disc TV setup (canonicalization + artwork + episode-numbering state).
     # Sets TV_FIRST_EPISODE so per-file rename math is consistent across the disc.
+    # If the show name can't be matched against TMDb, sets TV_UNMATCHED=1 and
+    # tv_rename_file routes files into _unmatched/<raw-label>/ for human review.
     TV_FIRST_EPISODE=""
     TV_PROGRESS_STATUS=""
+    TV_UNMATCHED=""
+    TV_UNMATCHED_LABEL=""
+    IS_TV_DISC=""
     if parse_tv_disc_title "$disc_title"; then
-        fetch_tv_artwork "$TV_SHOW" "$TV_SEASON" || true
+        IS_TV_DISC=1
+        local _raw_show="$TV_SHOW"
+        if canonicalize_tv_show "$_raw_show"; then
+            if [ "$TV_SHOW_CANONICAL" != "$_raw_show" ]; then
+                log "TV: canonicalized show name '$_raw_show' → '$TV_SHOW_CANONICAL' (TMDb id $TV_SHOW_TMDB_ID)"
+            fi
+            TV_SHOW="$TV_SHOW_CANONICAL"
 
-        if declare -F tv_progress_for_disc >/dev/null 2>&1 \
-           && tv_progress_for_disc "$TV_SHOW" "$TV_SEASON" "$TV_DISC" "${#file_paths[@]}"; then
-            log "TV: $TV_SHOW S${TV_SEASON}D${TV_DISC} → episodes start at E$(printf '%02d' "$TV_FIRST_EPISODE") (status=$TV_PROGRESS_STATUS)"
-            if [ "$TV_PROGRESS_STATUS" = "gap" ]; then
-                log "WARNING: out-of-order disc — episode numbering is a best-guess; review before approving"
+            fetch_tv_artwork "$TV_SHOW" "$TV_SEASON" || true
+
+            if declare -F tv_progress_for_disc >/dev/null 2>&1 \
+               && tv_progress_for_disc "$TV_SHOW" "$TV_SEASON" "$TV_DISC" "${#file_paths[@]}"; then
+                log "TV: $TV_SHOW S${TV_SEASON}D${TV_DISC} → episodes start at E$(printf '%02d' "$TV_FIRST_EPISODE") (status=$TV_PROGRESS_STATUS)"
+                if [ "$TV_PROGRESS_STATUS" = "gap" ]; then
+                    log "WARNING: out-of-order disc — episode numbering is a best-guess; review before approving"
+                fi
+            else
+                # Fallback to legacy global-config math
+                TV_FIRST_EPISODE=$(( (TV_DISC - 1) * EPISODES_PER_DISC + 1 ))
+                log "TV: progress lib unavailable, using legacy math (first episode = E$(printf '%02d' "$TV_FIRST_EPISODE"))"
             fi
         else
-            # Fallback to legacy global-config math
-            TV_FIRST_EPISODE=$(( (TV_DISC - 1) * EPISODES_PER_DISC + 1 ))
-            log "TV: progress lib unavailable, using legacy math (first episode = E$(printf '%02d' "$TV_FIRST_EPISODE"))"
+            log "TV: could not match show '$_raw_show' on TMDb — routing disc to _unmatched/"
+            TV_UNMATCHED=1
+            TV_UNMATCHED_LABEL="$disc_title"
         fi
     fi
 
@@ -854,8 +948,12 @@ process_job() {
 
         # Rename/move file to final location
         update_worker_status "renaming" "$processing_file" "[$file_num/$total_files] Organizing..."
-        if parse_tv_disc_title "$disc_title"; then
-            log "TV disc: $TV_SHOW Season $TV_SEASON Disc $TV_DISC — episode from title $tidx"
+        if [ -n "$IS_TV_DISC" ]; then
+            if [ -n "$TV_UNMATCHED" ]; then
+                log "TV disc (unmatched): $disc_title — title $tidx → _unmatched/"
+            else
+                log "TV disc: $TV_SHOW Season $TV_SEASON Disc $TV_DISC — episode from title $tidx"
+            fi
             tv_rename_file "$fp" "$tidx"
         else
             log "Movie disc: $disc_title"
@@ -865,7 +963,9 @@ process_job() {
 
     # Determine the unreviewed output directory for metadata.json
     local unreviewed_dest=""
-    if parse_tv_disc_title "$disc_title"; then
+    if [ -n "${TV_UNMATCHED:-}" ] && [ -n "${TV_UNMATCHED_LABEL:-}" ]; then
+        unreviewed_dest="$UNREVIEWED_TV/_unmatched/$TV_UNMATCHED_LABEL"
+    elif [ -n "$IS_TV_DISC" ]; then
         local season_dir
         season_dir=$(printf "Season %02d" "$TV_SEASON")
         unreviewed_dest="$UNREVIEWED_TV/$TV_SHOW/$season_dir"

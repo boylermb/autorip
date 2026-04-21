@@ -221,8 +221,8 @@ nothing reaches `Video/TV/`.
 | 2 | Add `fetch_tv_artwork()` + write `poster.jpg` / `tvshow.nfo` / `season-poster.jpg` | S | low | ✅ done | After a TV rip, the unreviewed directory contains the three artwork files |
 | 3 | Replace global `EPISODES_PER_DISC` math with per-show progress state file (`bin/lib/tv-progress.sh`) | M | medium (changes numbering semantics; legacy math kept as fallback) | ✅ done | New rips number correctly with variable episode counts; old rips untouched |
 | 4 | Add 3.3 layered play-all detection (sum-of-others + segment-count) | M | low (additive checks; existing 2.5× rule stays as fallback) | ✅ done | 6 unit tests in `tests/test_playall_detection.sh` cover box-set, 2-title, and segment-outlier cases |
-| 5 | Add show-name canonicalization + `_unmatched/` routing | S | low | ⏳ next | Disc with garbage label lands in `_unmatched/`, not in `Video/TV/Sp1/` |
-| 6 | Add `tv-overrides.yml` support | S | low | | Override file with one entry produces the overridden naming |
+| 5 | Add show-name canonicalization + `_unmatched/` routing | S | low | ✅ done | Disc with garbage label lands in `_unmatched/`, not in `Video/TV/Sp1/` |
+| 6 | Add `tv-overrides.yml` support | S | low | ⏳ next | Override file with one entry produces the overridden naming |
 | 7 | Add production-vs-aired mismatch detection + `_pending/` routing | M | medium (needs runtime-comparison heuristic tuning) | | A box set known to be production-order routes to `_pending/` |
 | 8 | media-review UI: `_unmatched/` + `_pending/` tabs | M | low | | Web UI exposes both buckets; user can move files into final naming |
 | 9 | Backfill: re-process existing TV directories that have no `poster.jpg` | S | none (read-only against TMDb; only writes artwork files) | | All `Video/TV/<Show>/` have `poster.jpg` |
