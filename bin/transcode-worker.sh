@@ -61,6 +61,10 @@ for _libdir in /usr/local/lib/autorip "$_SELF_DIR/lib"; do
         # shellcheck source=lib/tv-overrides.sh
         source "$_libdir/tv-overrides.sh"
     fi
+    if [ -f "$_libdir/tv-runtime-check.sh" ]; then
+        # shellcheck source=lib/tv-runtime-check.sh
+        source "$_libdir/tv-runtime-check.sh"
+    fi
     # Stop after the first directory that had at least one library
     if [ -f "$_libdir/tmdb.sh" ] || [ -f "$_libdir/tv-progress.sh" ] || [ -f "$_libdir/tv-overrides.sh" ]; then
         break
@@ -403,6 +407,20 @@ tv_rename_file() {
         base=$(basename "$mkv")
         mv -f "$mkv" "$unmatched_dir/$base"
         log "Unmatched TV disc: moved $base → $unmatched_dir/"
+        return 0
+    fi
+
+    # Pending-review fallback: TMDb runtimes disagree with actual file
+    # durations.  Park under _pending/ with the proposed-name suffix so a
+    # human can compare to the episodes-plan.txt sitting alongside.
+    if [ -n "${TV_PENDING:-}" ] && [ -n "${TV_PENDING_LABEL:-}" ]; then
+        local pending_dir="$UNREVIEWED_TV/_pending/$TV_PENDING_LABEL"
+        mkdir -p "$pending_dir"
+        local ep_num=$(( ${TV_FIRST_EPISODE:-1} + title_index - 1 ))
+        local proposed
+        proposed=$(printf "%s - S%02dE%02d.proposed.mkv" "$TV_SHOW" "$TV_SEASON" "$ep_num")
+        mv -f "$mkv" "$pending_dir/$proposed"
+        log "Pending review: moved $(basename "$mkv") → $pending_dir/$proposed"
         return 0
     fi
 
@@ -893,6 +911,9 @@ process_job() {
     TV_PROGRESS_STATUS=""
     TV_UNMATCHED=""
     TV_UNMATCHED_LABEL=""
+    TV_PENDING=""
+    TV_PENDING_LABEL=""
+    TV_RUNTIME_PLAN=""
     IS_TV_DISC=""
     if parse_tv_disc_title "$disc_title"; then
         IS_TV_DISC=1
@@ -948,6 +969,45 @@ process_job() {
                 TV_FIRST_EPISODE=$(( (TV_DISC - 1) * EPISODES_PER_DISC + 1 ))
                 log "TV: progress lib unavailable, using legacy math (first episode = E$(printf '%02d' "$TV_FIRST_EPISODE"))"
             fi
+
+            # Production-vs-aired runtime sanity check.  Loads the season's
+            # episode runtimes from TMDb and compares them to the actual
+            # MKV durations.  If 3+ disagree, the disc is parked in
+            # _pending/ for human review (probably production-order or
+            # extra/missing episodes).
+            if declare -F tv_check_runtime_match >/dev/null 2>&1 \
+               && [ -n "$TV_FIRST_EPISODE" ] \
+               && [ "$TV_PROGRESS_STATUS" != "gap" ]; then
+                # Ensure TMDB_EP_RUNTIMES is populated for this season
+                tmdb_fetch_season_by_name "$TV_SHOW" "$TV_SEASON" 2>/dev/null || true
+                tv_check_runtime_match "$TV_FIRST_EPISODE" "${file_paths[@]}"
+                if [ -n "$TV_RUNTIME_MISMATCH" ]; then
+                    log "WARNING: runtime mismatch detected — routing disc to _pending/ for review"
+                    TV_PENDING=1
+                    TV_PENDING_LABEL=$(printf "%s-S%02dD%02d" "$TV_SHOW" "$TV_SEASON" "$TV_DISC")
+                    # Drop a plan file in the pending dir alongside the files
+                    local _pending_dir="$UNREVIEWED_TV/_pending/$TV_PENDING_LABEL"
+                    mkdir -p "$_pending_dir"
+                    {
+                        echo "Disc:        $disc_title"
+                        echo "Show:        $TV_SHOW (TMDb id ${TV_SHOW_TMDB_ID:-?})"
+                        echo "Season:      $TV_SEASON"
+                        echo "Disc#:       $TV_DISC"
+                        echo "First ep:    E$(printf '%02d' "$TV_FIRST_EPISODE") (per progress state)"
+                        echo "Generated:   $(date -Iseconds 2>/dev/null || date)"
+                        echo
+                        echo "Reason: TMDb-reported episode runtimes disagree with actual MKV"
+                        echo "durations.  This is the typical signature of a disc pressed in"
+                        echo "production order rather than aired order, OR a disc with bonus"
+                        echo "content TMDb doesn't list."
+                        echo
+                        printf '%s' "$TV_RUNTIME_PLAN"
+                        echo
+                        echo "Action: review file lengths against the planned mapping above,"
+                        echo "rename manually, then move into Video/TV/$TV_SHOW/Season $(printf '%02d' "$TV_SEASON")/."
+                    } > "$_pending_dir/episodes-plan.txt"
+                fi
+            fi
         else
             log "TV: could not match show '$_raw_show' on TMDb (no override available) — routing disc to _unmatched/"
             TV_UNMATCHED=1
@@ -987,6 +1047,8 @@ process_job() {
         if [ -n "$IS_TV_DISC" ]; then
             if [ -n "$TV_UNMATCHED" ]; then
                 log "TV disc (unmatched): $disc_title — title $tidx → _unmatched/"
+            elif [ -n "$TV_PENDING" ]; then
+                log "TV disc (pending review): $TV_SHOW S${TV_SEASON}D${TV_DISC} — title $tidx → _pending/"
             else
                 log "TV disc: $TV_SHOW Season $TV_SEASON Disc $TV_DISC — episode from title $tidx"
             fi
@@ -1001,6 +1063,8 @@ process_job() {
     local unreviewed_dest=""
     if [ -n "${TV_UNMATCHED:-}" ] && [ -n "${TV_UNMATCHED_LABEL:-}" ]; then
         unreviewed_dest="$UNREVIEWED_TV/_unmatched/$TV_UNMATCHED_LABEL"
+    elif [ -n "${TV_PENDING:-}" ] && [ -n "${TV_PENDING_LABEL:-}" ]; then
+        unreviewed_dest="$UNREVIEWED_TV/_pending/$TV_PENDING_LABEL"
     elif [ -n "$IS_TV_DISC" ]; then
         local season_dir
         season_dir=$(printf "Season %02d" "$TV_SEASON")

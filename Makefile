@@ -110,6 +110,7 @@ install-scripts:
 	install -m 0644 bin/lib/tmdb.sh $(PREFIX)/lib/autorip/tmdb.sh
 	install -m 0644 bin/lib/tv-progress.sh $(PREFIX)/lib/autorip/tv-progress.sh
 	install -m 0644 bin/lib/tv-overrides.sh $(PREFIX)/lib/autorip/tv-overrides.sh
+	install -m 0644 bin/lib/tv-runtime-check.sh $(PREFIX)/lib/autorip/tv-runtime-check.sh
 	@# Example overrides file (only if no live one exists)
 	mkdir -p $(SYSCONFDIR)/autorip
 	@if [ ! -e $(SYSCONFDIR)/autorip/tv-overrides.json ]; then \
@@ -122,6 +123,7 @@ install-scripts:
 	@echo "    Installed $(PREFIX)/lib/autorip/tmdb.sh"
 	@echo "    Installed $(PREFIX)/lib/autorip/tv-progress.sh"
 	@echo "    Installed $(PREFIX)/lib/autorip/tv-overrides.sh"
+	@echo "    Installed $(PREFIX)/lib/autorip/tv-runtime-check.sh"
 
 install-services: configure-services
 	@echo "==> Installing systemd units and udev rules..."
@@ -160,6 +162,7 @@ install-worker: configure-services
 	install -m 0644 bin/lib/tmdb.sh $(PREFIX)/lib/autorip/tmdb.sh
 	install -m 0644 bin/lib/tv-progress.sh $(PREFIX)/lib/autorip/tv-progress.sh
 	install -m 0644 bin/lib/tv-overrides.sh $(PREFIX)/lib/autorip/tv-overrides.sh
+	install -m 0644 bin/lib/tv-runtime-check.sh $(PREFIX)/lib/autorip/tv-runtime-check.sh
 	install -m 0644 build/transcode-worker.service $(SYSTEMDDIR)/transcode-worker.service
 	install -m 0644 systemd/transcode-worker.timer $(SYSTEMDDIR)/transcode-worker.timer
 	systemctl daemon-reload
