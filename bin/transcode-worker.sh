@@ -310,6 +310,15 @@ parse_tv_disc_title() {
         return 0
     fi
 
+    # Human / BDMV form: "Show Name: Season 7: Disc 1" — feeds in via disc_title_human
+    # (CINFO:2 from MakeMKV / bdmt_eng.xml). Spaces preserved.
+    if echo "$disc_title" | grep -qiE '[:_ -]+season[ _]*[0-9]+[:_ -]+disc[ _]*[0-9]+( *)$'; then
+        TV_SHOW=$(echo "$disc_title" | sed -E 's/[[:space:]]*[:_-]+[[:space:]]*[Ss]eason[[:space:]_]*[0-9]+[[:space:]]*[:_-]+[[:space:]]*[Dd]isc[[:space:]_]*[0-9]+[[:space:]]*$//')
+        TV_SEASON=$(echo "$disc_title" | grep -oiE 'season[ _]*[0-9]+' | grep -oE '[0-9]+' | sed 's/^0*//')
+        TV_DISC=$(echo "$disc_title" | grep -oiE 'disc[ _]*[0-9]+' | grep -oE '[0-9]+' | sed 's/^0*//')
+        return 0
+    fi
+
     return 1
 }
 
@@ -881,8 +890,9 @@ process_job() {
     update_worker_status "transcoding" "$job_file" "Reading job..."
 
     # Parse job JSON (minimal — use grep/sed, no jq dependency)
-    local disc_title disc_type source_host title_count is_uhd staging_dir
+    local disc_title disc_title_human disc_type source_host title_count is_uhd staging_dir
     disc_title=$(grep -oP '"disc_title"\s*:\s*"\K[^"]+' "$job_file" || echo "")
+    disc_title_human=$(grep -oP '"disc_title_human"\s*:\s*"\K[^"]*' "$job_file" || echo "")
     disc_type=$(grep -oP '"disc_type"\s*:\s*"\K[^"]+' "$job_file" || echo "DVD")
     source_host=$(grep -oP '"source_host"\s*:\s*"\K[^"]+' "$job_file" || echo "unknown")
     title_count=$(grep -oP '"title_count"\s*:\s*\K[0-9]+' "$job_file" || echo "0")
@@ -947,7 +957,14 @@ process_job() {
     TV_PENDING_LABEL=""
     TV_RUNTIME_PLAN=""
     IS_TV_DISC=""
+    local _tv_parsed=""
     if parse_tv_disc_title "$disc_title"; then
+        _tv_parsed=1
+    elif [ -n "$disc_title_human" ] && parse_tv_disc_title "$disc_title_human"; then
+        _tv_parsed=1
+        log "TV: parsed from disc_title_human '$disc_title_human' (volume label '$disc_title' had no S/D markers)"
+    fi
+    if [ -n "$_tv_parsed" ]; then
         IS_TV_DISC=1
         local _raw_show="$TV_SHOW"
 

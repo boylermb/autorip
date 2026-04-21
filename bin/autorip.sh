@@ -520,6 +520,16 @@ parse_tv_disc_title() {
         return 0
     fi
 
+    # Human / BDMV form: "Show Name: Season 7: Disc 1" or "Show Name - Season 7 - Disc 1"
+    # (Spaces preserved — this is CINFO:2 / bdmt_eng.xml content, never a folder name.)
+    if echo "$disc_title" | grep -qiE '[:_ -]+season[ _]*[0-9]+[:_ -]+disc[ _]*[0-9]+( *)$'; then
+        TV_SHOW=$(echo "$disc_title" | sed -E 's/[[:space:]]*[:_-]+[[:space:]]*[Ss]eason[[:space:]_]*[0-9]+[[:space:]]*[:_-]+[[:space:]]*[Dd]isc[[:space:]_]*[0-9]+[[:space:]]*$//')
+        TV_SEASON=$(echo "$disc_title" | grep -oiE 'season[ _]*[0-9]+' | grep -oE '[0-9]+' | sed 's/^0*//')
+        TV_DISC=$(echo "$disc_title" | grep -oiE 'disc[ _]*[0-9]+' | grep -oE '[0-9]+' | sed 's/^0*//')
+        log "TV disc detected (human format): show='$TV_SHOW' season=$TV_SEASON disc=$TV_DISC"
+        return 0
+    fi
+
     return 1
 }
 
@@ -617,7 +627,8 @@ enqueue_video_disc() {
     local disc_type="$2"
     local is_uhd="${3:-false}"
     local staging_dir="$4"
-    shift 4
+    local disc_title_human="$5"
+    shift 5
     # Remaining args are "title_index:file_path" pairs
     local -a file_entries=("$@")
 
@@ -644,6 +655,7 @@ enqueue_video_disc() {
     cat > "$tmpfile" <<ENDJOB
 {
     "disc_title": "$(printf '%s' "$disc_title" | sed 's/\\/\\\\/g; s/"/\\"/g')",
+    "disc_title_human": "$(printf '%s' "$disc_title_human" | sed 's/\\/\\\\/g; s/"/\\"/g')",
     "disc_type": "$disc_type",
     "is_uhd": $is_uhd,
     "staging_dir": "$staging_dir",
@@ -806,16 +818,22 @@ rip_video_disc() {
 
     # --- Disc title ---
     # CINFO:32 = volume label (e.g. "APOLLO13_UHD_UPK1") — safe for folder names.
-    # Fall back to CINFO:2 (human-friendly name) if 32 is missing.
+    # CINFO:2  = human-friendly title (e.g. "Murder, She Wrote: Season 7: Disc 1"
+    #            from BDMV bdmt_eng.xml or DVD VTS metadata) — better signal for
+    #            TMDb show resolution.
+    # We capture BOTH and propagate the human title via the job JSON so the
+    # transcode worker's TV resolver can fall back to it when the volume label
+    # is missing or doesn't carry an S{n}D{n} marker.
     DISC_TITLE=$(echo "$MAKEMKV_INFO" | grep '^CINFO:32,' | head -1 | sed 's/^CINFO:32,[^,]*,//; s/^"//; s/"$//' | tr ' ' '_' || echo "")
-    if [ -z "$DISC_TITLE" ]; then
-        DISC_TITLE=$(echo "$MAKEMKV_INFO" | grep '^CINFO:2,' | head -1 | sed 's/^CINFO:2,[^,]*,//; s/^"//; s/"$//' | tr ' ' '_' || echo "")
+    DISC_TITLE_HUMAN=$(echo "$MAKEMKV_INFO" | grep '^CINFO:2,' | head -1 | sed 's/^CINFO:2,[^,]*,//; s/^"//; s/"$//' || echo "")
+    if [ -z "$DISC_TITLE" ] && [ -n "$DISC_TITLE_HUMAN" ]; then
+        DISC_TITLE=$(echo "$DISC_TITLE_HUMAN" | tr ' ' '_')
     fi
     if [ -z "$DISC_TITLE" ]; then
         DISC_TITLE="$fallback_title"
         log "WARNING: Could not determine disc title, using $DISC_TITLE"
     fi
-    log "Disc title: $DISC_TITLE"
+    log "Disc title: $DISC_TITLE${DISC_TITLE_HUMAN:+ (human: $DISC_TITLE_HUMAN)}"
 
     # ---------- UHD Blu-ray detection ----------
     # MakeMKV reports "AACS2" or "BDMV 4K" for UHD discs.  Check the info
@@ -1003,7 +1021,7 @@ rip_video_disc() {
     done
 
     if [ ${#ripped_files[@]} -gt 0 ]; then
-        enqueue_video_disc "$DISC_TITLE" "$disc_type" "$is_uhd" "$OUTPUT_DIR" "${ripped_files[@]}"
+        enqueue_video_disc "$DISC_TITLE" "$disc_type" "$is_uhd" "$OUTPUT_DIR" "${DISC_TITLE_HUMAN:-}" "${ripped_files[@]}"
     else
         log "WARNING: No titles ripped successfully"
     fi
