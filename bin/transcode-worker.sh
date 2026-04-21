@@ -45,6 +45,24 @@ fi
 # shellcheck source=/etc/autorip/autorip.conf
 source "$AUTORIP_CONF"
 
+# ---------- Load helper libraries ----------
+# Look in install location first, then alongside this script (dev mode).
+_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for _libdir in /usr/local/lib/autorip "$_SELF_DIR/lib"; do
+    if [ -f "$_libdir/tmdb.sh" ]; then
+        # shellcheck source=lib/tmdb.sh
+        source "$_libdir/tmdb.sh"
+    fi
+    if [ -f "$_libdir/tv-progress.sh" ]; then
+        # shellcheck source=lib/tv-progress.sh
+        source "$_libdir/tv-progress.sh"
+    fi
+    # Stop after the first directory that had at least one library
+    if [ -f "$_libdir/tmdb.sh" ] || [ -f "$_libdir/tv-progress.sh" ]; then
+        break
+    fi
+done
+
 LOGPREFIX="[transcode-worker]"
 QUEUE_DIR="$OUTPUT_BASE/.autorip-queue"
 STAGING_DIR="$OUTPUT_BASE/.autorip-staging"
@@ -288,73 +306,19 @@ parse_tv_disc_title() {
 }
 
 # ---------- TMDb episode name lookup ----------
-# Looks up a TV show on TMDb and caches the season episode list.
-# Sets TMDB_EP_NAMES associative array: TMDB_EP_NAMES[ep_num]="Episode Title"
-declare -A TMDB_EP_NAMES
-TMDB_SHOW_CACHED=""
-
-tmdb_fetch_season() {
+# Wrapper around the shared tmdb library that preserves the (show_name, season)
+# call signature used by tv_rename_file. Sets TMDB_EP_NAMES[ep#].
+tmdb_fetch_season_by_name() {
     local show="$1"
     local season="$2"
-    local api_key="${TMDB_API_KEY:-db972a607f2760bb19ff8bb34074b4c7}"
 
-    # Skip if already cached for this show+season
-    local cache_key="${show}::${season}"
-    if [ "$TMDB_SHOW_CACHED" = "$cache_key" ] && [ ${#TMDB_EP_NAMES[@]} -gt 0 ]; then
-        return 0
-    fi
-
-    TMDB_EP_NAMES=()
-    TMDB_SHOW_CACHED=""
-
-    # Search for the show to get its TMDb ID
-    local encoded_show
-    encoded_show=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$show'))" 2>/dev/null) || return 1
-
-    local search_result
-    search_result=$(curl -sf "https://api.themoviedb.org/3/search/tv?query=${encoded_show}&api_key=${api_key}" 2>/dev/null) || {
-        log "TMDb: Search API call failed for '$show'"
-        return 1
-    }
-
-    local show_id
-    show_id=$(echo "$search_result" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-results = data.get('results', [])
-if results:
-    print(results[0]['id'])
-" 2>/dev/null) || return 1
-
-    if [ -z "$show_id" ]; then
-        log "TMDb: No results found for '$show'"
+    if ! declare -F tmdb_search_show >/dev/null 2>&1; then
+        log "TMDb library not loaded — episode titles will not be available"
         return 1
     fi
 
-    log "TMDb: Found show '$show' → ID $show_id"
-
-    # Fetch season episodes
-    local season_result
-    season_result=$(curl -sf "https://api.themoviedb.org/3/tv/${show_id}/season/${season}?api_key=${api_key}" 2>/dev/null) || {
-        log "TMDb: Season API call failed for show $show_id season $season"
-        return 1
-    }
-
-    # Parse episode names into the associative array
-    eval "$(echo "$season_result" | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-for ep in data.get('episodes', []):
-    num = ep['episode_number']
-    name = ep['name'].replace(\"'\", \"'\\\\''\").replace('\"', '\\\\\"')
-    print(f\"TMDB_EP_NAMES[{num}]='{name}'\")
-" 2>/dev/null)" || {
-        log "TMDb: Failed to parse season data"
-        return 1
-    }
-
-    TMDB_SHOW_CACHED="$cache_key"
-    log "TMDb: Loaded ${#TMDB_EP_NAMES[@]} episode name(s) for '$show' season $season"
+    tmdb_search_show "$show" || return 1
+    tmdb_fetch_season "$TMDB_SHOW_ID" "$season" || return 1
     return 0
 }
 
@@ -367,13 +331,19 @@ tv_rename_file() {
     local dest_dir="$UNREVIEWED_TV/$TV_SHOW/$season_dir"
     mkdir -p "$dest_dir"
 
-    # Episode number: (disc - 1) * episodes_per_disc + title_index
-    local ep_num=$(( (TV_DISC - 1) * EPISODES_PER_DISC + title_index ))
+    # Episode number: prefer per-show progress state (TV_FIRST_EPISODE set by
+    # the disc handler); fall back to legacy global-config math if unset.
+    local ep_num
+    if [ -n "${TV_FIRST_EPISODE:-}" ]; then
+        ep_num=$(( TV_FIRST_EPISODE + title_index - 1 ))
+    else
+        ep_num=$(( (TV_DISC - 1) * EPISODES_PER_DISC + title_index ))
+    fi
     local ep_name
 
     # Try to get episode title from TMDb
     local ep_title=""
-    if tmdb_fetch_season "$TV_SHOW" "$TV_SEASON" 2>/dev/null; then
+    if tmdb_fetch_season_by_name "$TV_SHOW" "$TV_SEASON" 2>/dev/null; then
         ep_title="${TMDB_EP_NAMES[$ep_num]:-}"
     fi
 
@@ -387,6 +357,72 @@ tv_rename_file() {
     fi
     mv -f "$mkv" "$dest_dir/$ep_name"
     log "Moved $(basename "$mkv") → $dest_dir/$ep_name"
+}
+
+# ---------- TV artwork (poster + show.nfo + season-poster) ----------
+# Idempotent: skips files that already exist.
+# Uses TMDB_SHOW_ID populated by tmdb_search_show; if not loaded, no-ops.
+fetch_tv_artwork() {
+    local show="$1"
+    local season="$2"
+
+    if ! declare -F tmdb_search_show >/dev/null 2>&1; then
+        return 0  # library not loaded — silently skip
+    fi
+
+    local show_dir="$UNREVIEWED_TV/$show"
+    local season_dir
+    season_dir=$(printf "Season %02d" "$season")
+    local season_path="$show_dir/$season_dir"
+    mkdir -p "$season_path"
+
+    local poster="$show_dir/poster.jpg"
+    local nfo="$show_dir/tvshow.nfo"
+    local season_poster="$season_path/season-poster.jpg"
+
+    # Short-circuit if everything already exists
+    if [ -s "$poster" ] && [ -s "$nfo" ] && [ -s "$season_poster" ]; then
+        return 0
+    fi
+
+    # Resolve TMDb ID
+    if ! tmdb_search_show "$show" 2>/dev/null; then
+        log "Artwork: could not find '$show' on TMDb; skipping artwork"
+        return 1
+    fi
+
+    # Show-level poster
+    if [ ! -s "$poster" ]; then
+        if tmdb_fetch_show_images "$TMDB_SHOW_ID" 2>/dev/null && [ -n "$TMDB_POSTER_URL" ]; then
+            if tmdb_download_image "$TMDB_POSTER_URL" "$poster"; then
+                log "Artwork: downloaded poster → $poster"
+            fi
+        fi
+    fi
+
+    # tvshow.nfo (Jellyfin/Kodi standard)
+    if [ ! -s "$nfo" ] && [ -n "$TMDB_SHOW_ID" ]; then
+        cat > "$nfo" <<EOF
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<tvshow>
+  <title>$(echo "${TMDB_SHOW_NAME:-$show}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')</title>
+  <uniqueid type="tmdb" default="true">${TMDB_SHOW_ID}</uniqueid>
+</tvshow>
+EOF
+        log "Artwork: wrote $nfo"
+    fi
+
+    # Season-level poster
+    if [ ! -s "$season_poster" ]; then
+        if tmdb_fetch_season_images "$TMDB_SHOW_ID" "$season" 2>/dev/null \
+           && [ -n "$TMDB_SEASON_POSTER_URL" ]; then
+            if tmdb_download_image "$TMDB_SEASON_POSTER_URL" "$season_poster"; then
+                log "Artwork: downloaded season poster → $season_poster"
+            fi
+        fi
+    fi
+
+    return 0
 }
 
 # ---------- Movie rename (single file, mnamer) ----------
@@ -768,6 +804,26 @@ process_job() {
     local processing_file="${job_file%.json}.processing"
 
     log "Processing disc: $disc_title (${#file_paths[@]} title(s), from $source_host)"
+
+    # Per-disc TV setup (artwork + episode-numbering state).
+    # Sets TV_FIRST_EPISODE so per-file rename math is consistent across the disc.
+    TV_FIRST_EPISODE=""
+    TV_PROGRESS_STATUS=""
+    if parse_tv_disc_title "$disc_title"; then
+        fetch_tv_artwork "$TV_SHOW" "$TV_SEASON" || true
+
+        if declare -F tv_progress_for_disc >/dev/null 2>&1 \
+           && tv_progress_for_disc "$TV_SHOW" "$TV_SEASON" "$TV_DISC" "${#file_paths[@]}"; then
+            log "TV: $TV_SHOW S${TV_SEASON}D${TV_DISC} → episodes start at E$(printf '%02d' "$TV_FIRST_EPISODE") (status=$TV_PROGRESS_STATUS)"
+            if [ "$TV_PROGRESS_STATUS" = "gap" ]; then
+                log "WARNING: out-of-order disc — episode numbering is a best-guess; review before approving"
+            fi
+        else
+            # Fallback to legacy global-config math
+            TV_FIRST_EPISODE=$(( (TV_DISC - 1) * EPISODES_PER_DISC + 1 ))
+            log "TV: progress lib unavailable, using legacy math (first episode = E$(printf '%02d' "$TV_FIRST_EPISODE"))"
+        fi
+    fi
 
     # Detect GPU
     local ffmpeg_video_opts="-c:v libx265 -crf 24 -preset medium"

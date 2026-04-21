@@ -105,7 +105,13 @@ install-config:
 install-scripts:
 	@echo "==> Installing scripts..."
 	install -m 0755 bin/autorip.sh $(PREFIX)/bin/autorip.sh
+	@# Shared shell libraries (sourced by autorip.sh and transcode-worker.sh)
+	mkdir -p $(PREFIX)/lib/autorip
+	install -m 0644 bin/lib/tmdb.sh $(PREFIX)/lib/autorip/tmdb.sh
+	install -m 0644 bin/lib/tv-progress.sh $(PREFIX)/lib/autorip/tv-progress.sh
 	@echo "    Installed $(PREFIX)/bin/autorip.sh"
+	@echo "    Installed $(PREFIX)/lib/autorip/tmdb.sh"
+	@echo "    Installed $(PREFIX)/lib/autorip/tv-progress.sh"
 
 install-services: configure-services
 	@echo "==> Installing systemd units and udev rules..."
@@ -139,6 +145,10 @@ install-agent:
 install-worker: configure-services
 	@echo "==> Installing GPU transcode worker..."
 	install -m 0755 bin/transcode-worker.sh $(PREFIX)/bin/transcode-worker.sh
+	@# Shared shell libraries (in case install-scripts wasn't run on this node)
+	mkdir -p $(PREFIX)/lib/autorip
+	install -m 0644 bin/lib/tmdb.sh $(PREFIX)/lib/autorip/tmdb.sh
+	install -m 0644 bin/lib/tv-progress.sh $(PREFIX)/lib/autorip/tv-progress.sh
 	install -m 0644 build/transcode-worker.service $(SYSTEMDDIR)/transcode-worker.service
 	install -m 0644 systemd/transcode-worker.timer $(SYSTEMDDIR)/transcode-worker.timer
 	systemctl daemon-reload
@@ -179,6 +189,7 @@ uninstall:
 	-systemctl disable autorip-agent transcode-worker.timer 2>/dev/null || true
 	rm -f $(PREFIX)/bin/autorip.sh
 	rm -f $(PREFIX)/bin/transcode-worker.sh
+	rm -rf $(PREFIX)/lib/autorip
 	rm -f $(SYSTEMDDIR)/autorip@.service
 	rm -f $(SYSTEMDDIR)/transcode-worker.service
 	rm -f $(SYSTEMDDIR)/transcode-worker.timer
