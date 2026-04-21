@@ -36,6 +36,17 @@ fi
 # shellcheck source=/etc/autorip/autorip.conf
 source "$AUTORIP_CONF"
 
+# ---------- Load helper libraries ----------
+# Look in install location first, then alongside this script (dev mode).
+_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for _libdir in /usr/local/lib/autorip "$_SELF_DIR/lib"; do
+    if [ -f "$_libdir/tmdb.sh" ]; then
+        # shellcheck source=lib/tmdb.sh
+        source "$_libdir/tmdb.sh"
+        break
+    fi
+done
+
 DEVICE="${1:?Usage: autorip.sh /dev/srX}"
 LOGPREFIX="[autorip $(basename "$DEVICE")]"
 
@@ -835,47 +846,111 @@ rip_video_disc() {
     done < <(echo "$MAKEMKV_INFO" | grep '^TINFO:' | cut -d',' -f1 | sed 's/^TINFO://' | sort -un)
 
     # --- Filter out "play all" consolidated titles ---
-    # On multi-episode DVD/Blu-ray box sets, MakeMKV often includes a playlist
-    # that concatenates all episodes into one giant title.  Detect and skip it
-    # by comparing durations: if one title is ≥2.5x the median duration of the
-    # others, it's almost certainly the "play all" concatenation.
-    if [ "${#TITLE_IDS[@]}" -ge 3 ]; then
-        # Extract duration (attribute 9) for each title in seconds
+    # On multi-episode DVD/Blu-ray box sets, MakeMKV often includes one or more
+    # playlists that concatenate every episode into a single giant title.  We
+    # apply three independent signals; a title flagged by ANY is treated as a
+    # compilation and skipped (provided at least 2 titles remain):
+    #
+    #   A. sum-of-others   — title duration ≈ sum of all other titles (±15%)
+    #   B. segment outlier — MakeMKV segment count (TINFO attr 25) ≥ 2× median
+    #                        AND duration ≥ 1.8× median duration
+    #   C. duration outlier (legacy) — duration ≥ 2.5× median duration
+    #
+    # Signal A handles the common 1-playall + N-episodes case down to N=2.
+    # Signal B catches playlists that splice many small segments even when their
+    # duration is only modestly above the median (e.g. "play all minus intro").
+    # Signal C is the original heuristic, kept as a fallback.
+    if [ "${#TITLE_IDS[@]}" -ge 2 ]; then
         declare -A title_durations=()
+        declare -A title_segments=()
+        local _total_dur=0
         for tid in "${TITLE_IDS[@]}"; do
             local dur_str
             dur_str=$(echo "$MAKEMKV_INFO" | grep "^TINFO:${tid},9," | head -1 | sed 's/.*,"//' | tr -d '"' || true)
             if [ -n "$dur_str" ]; then
                 local h m s
                 IFS=: read -r h m s <<< "$dur_str"
-                title_durations[$tid]=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+                local _d=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+                title_durations[$tid]=$_d
+                _total_dur=$(( _total_dur + _d ))
             fi
+            # Segment count (attribute 25) — quoted integer; absent on some discs
+            local seg_str
+            seg_str=$(echo "$MAKEMKV_INFO" | grep "^TINFO:${tid},25," | head -1 | sed 's/.*,"//' | tr -d '"' || true)
+            title_segments[$tid]="${seg_str:-0}"
         done
 
+        declare -A _is_playall=()
+
+        # Signal A — sum-of-others (requires ≥3 titles to avoid false-positives
+        # on movie + bonus pairs)
         if [ "${#title_durations[@]}" -ge 3 ]; then
-            # Sort durations to find median
+            for tid in "${TITLE_IDS[@]}"; do
+                local tdur="${title_durations[$tid]:-0}"
+                [ "$tdur" -gt 0 ] || continue
+                local others=$(( _total_dur - tdur ))
+                [ "$others" -gt 0 ] || continue
+                local diff
+                if [ "$tdur" -ge "$others" ]; then diff=$(( tdur - others )); else diff=$(( others - tdur )); fi
+                if [ $(( diff * 100 )) -le $(( others * 15 )) ]; then
+                    _is_playall[$tid]=1
+                    log "Play-all detected (sum-of-others): title $tid dur=${tdur}s vs sum-others=${others}s"
+                fi
+            done
+        fi
+
+        # Signals B & C — need a duration median (≥3 titles)
+        if [ "${#title_durations[@]}" -ge 3 ]; then
             local -a sorted_durs=()
             while IFS= read -r d; do
                 sorted_durs+=("$d")
             done < <(for tid in "${TITLE_IDS[@]}"; do echo "${title_durations[$tid]:-0}"; done | sort -n)
-            local median_idx=$(( ${#sorted_durs[@]} / 2 ))
-            local median_dur="${sorted_durs[$median_idx]}"
+            local median_dur="${sorted_durs[$(( ${#sorted_durs[@]} / 2 ))]}"
 
-            if [ "$median_dur" -gt 0 ] 2>/dev/null; then
-                local -a filtered_ids=()
+            local -a sorted_segs=()
+            while IFS= read -r s; do
+                sorted_segs+=("$s")
+            done < <(for tid in "${TITLE_IDS[@]}"; do echo "${title_segments[$tid]:-0}"; done | sort -n)
+            local median_seg="${sorted_segs[$(( ${#sorted_segs[@]} / 2 ))]}"
+
+            if [ "${median_dur:-0}" -gt 0 ] 2>/dev/null; then
                 for tid in "${TITLE_IDS[@]}"; do
+                    [ -n "${_is_playall[$tid]:-}" ] && continue
                     local tdur="${title_durations[$tid]:-0}"
-                    # Skip titles ≥2.5x the median (consolidated "play all")
-                    local threshold=$(( median_dur * 25 / 10 ))
-                    if [ "$tdur" -ge "$threshold" ] 2>/dev/null; then
-                        log "Skipping title $tid — likely 'play all' (${title_durations[$tid]}s vs median ${median_dur}s)"
-                    else
-                        filtered_ids+=("$tid")
+                    local tseg="${title_segments[$tid]:-0}"
+
+                    # Signal C — duration ≥ 2.5× median
+                    if [ "$tdur" -ge $(( median_dur * 25 / 10 )) ] 2>/dev/null; then
+                        _is_playall[$tid]=1
+                        log "Play-all detected (duration outlier): title $tid dur=${tdur}s vs median ${median_dur}s"
+                        continue
+                    fi
+
+                    # Signal B — segments ≥ 2× median AND duration ≥ 1.8× median
+                    if [ "${median_seg:-0}" -gt 0 ] 2>/dev/null \
+                       && [ "$tseg" -ge $(( median_seg * 2 )) ] 2>/dev/null \
+                       && [ "$tdur" -ge $(( median_dur * 18 / 10 )) ] 2>/dev/null; then
+                        _is_playall[$tid]=1
+                        log "Play-all detected (segment outlier): title $tid segs=${tseg} (median ${median_seg}), dur=${tdur}s (median ${median_dur}s)"
                     fi
                 done
-                if [ "${#filtered_ids[@]}" -ge 2 ]; then
-                    TITLE_IDS=("${filtered_ids[@]}")
+            fi
+        fi
+
+        # Apply removals, but never reduce the list below 2 titles
+        if [ "${#_is_playall[@]}" -gt 0 ]; then
+            local -a filtered_ids=()
+            for tid in "${TITLE_IDS[@]}"; do
+                if [ -n "${_is_playall[$tid]:-}" ]; then
+                    log "Skipping title $tid — flagged as 'play all' compilation"
+                else
+                    filtered_ids+=("$tid")
                 fi
+            done
+            if [ "${#filtered_ids[@]}" -ge 2 ]; then
+                TITLE_IDS=("${filtered_ids[@]}")
+            else
+                log "WARN: play-all filter would leave <2 titles; keeping original list"
             fi
         fi
     fi
