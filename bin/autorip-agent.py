@@ -1318,9 +1318,35 @@ def review_tmdb_lookup():
     if not ep_names:
         return jsonify({"error": "No episodes found in TMDb season data"}), 404
 
-    # Rename files: match SxxExx pattern and append episode title
+    # Also fetch the show details so we can update the displayed title.
+    # Pending-bucket items typically carry a raw disc label like
+    # "FUTURAMA_S4_D2" as their disc_title and need this to surface as
+    # the canonical show name in the review UI.
+    show_name = None
+    try:
+        show_url = f"https://api.themoviedb.org/3/tv/{show_id}?api_key={api_key}"
+        show_req = urllib.request.Request(show_url)
+        show_req.add_header("User-Agent", "autorip/1.0")
+        with urllib.request.urlopen(show_req, timeout=15) as sresp:
+            show_data = json.loads(sresp.read())
+        show_name = (show_data.get("name") or "").strip() or None
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError):
+        show_name = None
+
+    # Rename files: match SxxExx pattern and append episode title.
+    # Accept three filename shapes produced by the TV worker:
+    #   1. "<prefix>S07E03.mkv"                       (already matched)
+    #   2. "<prefix>S07E03 - Old Title.mkv"           (re-lookup, replace title)
+    #   3. "<prefix>S07E03.proposed.mkv"              (pending bucket — drop ".proposed")
+    # In all cases we rebuild as "<prefix>S07E03 - <Episode Title>.mkv".
     renamed_files = []
-    ep_pattern = re.compile(r'^(.*S\d{2}E(\d{2}))((?:\s*-\s*.+)?)(\.mkv)$', re.IGNORECASE)
+    ep_pattern = re.compile(
+        r'^(.*S\d{2}E(\d{2}))'
+        r'((?:\s*-\s*.+?)?)'
+        r'(?:\.proposed)?'
+        r'(\.mkv)$',
+        re.IGNORECASE,
+    )
     for fname in sorted(os.listdir(item_dir)):
         fm = ep_pattern.match(fname)
         if not fm:
@@ -1347,6 +1373,14 @@ def review_tmdb_lookup():
                 job_data = json.load(fh)
             job_data["tmdb_id"] = show_id
             job_data["tmdb_season"] = int(season_num)
+            # Surface the canonical show name in the review UI.  The card
+            # title falls back through album → disc_title → meta.disc_title,
+            # so writing both keeps existing items in sync regardless of
+            # which one was previously populated by the worker.
+            if show_name:
+                job_data["show"] = show_name
+                job_data["disc_title"] = show_name
+                job_data.setdefault("album", show_name)
             # Update tracks list with episode names
             tracks = []
             for fname in sorted(os.listdir(item_dir)):
@@ -1380,11 +1414,17 @@ def review_tmdb_lookup():
             except (urllib.error.URLError, OSError):
                 pass
 
+    msg_bits = [f"renamed {len(renamed_files)} file(s)"]
+    if show_name:
+        msg_bits.append(f"title → '{show_name}'")
+    if art_fetched:
+        msg_bits.append("poster fetched")
     return jsonify({
         "ok": True,
-        "message": f"TMDb: renamed {len(renamed_files)} file(s){', poster fetched' if art_fetched else ''}",
+        "message": "TMDb: " + ", ".join(msg_bits),
         "renamed_files": renamed_files,
         "episode_names": ep_names,
+        "show_name": show_name,
     })
 
 
