@@ -1519,6 +1519,64 @@ fi
 log "Transcode worker starting — checking queue..."
 update_worker_status "scanning" "" "Checking for jobs..."
 
+# --------------------------------------------------------------------------
+# Recover stale .processing jobs.
+#
+# A job stays in the .processing state for the duration of its transcode.
+# If the worker (or its parent ffmpeg) is killed mid-job — common during
+# `make install` redeploys, OOM, host reboot, or NFS hiccups — the file
+# is stranded forever because the main loop only globs *.json.
+#
+# Recovery rule: if a *.processing file is older than the lock we just
+# acquired AND no other worker holds the global lock (we just proved
+# that), then nothing can possibly still be working on it.  We wipe any
+# partial *.transcoding.mkv files for its source titles and rename the
+# job back to *.json so this run picks it up again.
+# --------------------------------------------------------------------------
+shopt -s nullglob
+stale_count=0
+for stale in "$QUEUE_DIR"/*.processing; do
+    stale_count=$((stale_count + 1))
+    log "WARN  Recovering orphaned job: $(basename "$stale")"
+
+    # Best-effort: clean up any partial transcode outputs referenced by
+    # the job so ffmpeg doesn't trip over a half-written file on retry.
+    if command -v python3 >/dev/null 2>&1; then
+        while IFS= read -r partial; do
+            [ -n "$partial" ] || continue
+            if [ -f "$partial" ]; then
+                log "WARN    Removing partial transcode: $partial"
+                rm -f "$partial"
+            fi
+        done < <(python3 - "$stale" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        job = json.load(fh)
+except Exception:
+    sys.exit(0)
+paths = []
+fp = job.get("file_path")
+if fp:
+    paths.append(fp)
+for entry in job.get("files", []) or []:
+    fp = entry.get("file_path")
+    if fp:
+        paths.append(fp)
+for p in paths:
+    if p.endswith(".mkv"):
+        print(p[:-4] + ".transcoding.mkv")
+PY
+        )
+    fi
+
+    mv -f "$stale" "${stale%.processing}.json" 2>/dev/null || true
+done
+shopt -u nullglob
+if [ "$stale_count" -gt 0 ]; then
+    log "Requeued $stale_count orphaned job(s) for retry."
+fi
+
 job_count=0
 for job_file in "$QUEUE_DIR"/*.json; do
     [ -f "$job_file" ] || continue
