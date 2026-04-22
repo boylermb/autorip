@@ -1015,9 +1015,14 @@ rip_video_disc() {
             --noscan \
             --progress=-stdout 2>&1; then
 
-            mkv_file=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*_t$(printf '%02d' "$tid").mkv" -newer "$LOCKFILE" 2>/dev/null | head -1)
+            # Locate the freshly-written MKV. Both lookups must tolerate
+            # SIGPIPE under `set -o pipefail` — `find | head` can race when
+            # find writes more output than head reads (e.g. NFS metadata
+            # cache surfaces a stale match), causing the whole script to
+            # die between titles. The trailing `|| true` swallows that.
+            mkv_file=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*_t$(printf '%02d' "$tid").mkv" -newer "$LOCKFILE" 2>/dev/null | head -1 || true)
             if [ -z "$mkv_file" ]; then
-                mkv_file=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*.mkv" -newer "$LOCKFILE" 2>/dev/null | sort -t/ -k2 | tail -1)
+                mkv_file=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*.mkv" -newer "$LOCKFILE" 2>/dev/null | sort -t/ -k2 | tail -1 || true)
             fi
 
             if [ -n "$mkv_file" ] && [ -f "$mkv_file" ]; then
