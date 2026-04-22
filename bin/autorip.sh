@@ -777,16 +777,31 @@ is_bluray=false
 is_dvd=false
 is_audio_cd=false
 
-if echo "$disc_info" | grep -q "ID_CDROM_MEDIA_BD=1"; then
+# Match ID_CDROM_MEDIA_BD as well as ID_CDROM_MEDIA_BD_R / _BD_RE / _BD_R_DL
+# (writeable BD variants, e.g. burned BD-R copies).
+if echo "$disc_info" | grep -qE 'ID_CDROM_MEDIA_BD(_[A-Z_]+)?=1'; then
     is_bluray=true
     # UHD Blu-rays also report ID_CDROM_MEDIA_BD=1.  We distinguish them
     # later using MakeMKV's disc info (AACS v2 / 4K resolution) once we
     # have the disc title scan results.
     log "Detected: Blu-ray disc (checking for UHD...)"
     update_status "ripping" "Blu-ray" "" "Detecting..."
-elif echo "$disc_info" | grep -q "ID_CDROM_MEDIA_DVD=1"; then
+# Match ID_CDROM_MEDIA_DVD plus all DVD recordable variants:
+#   ID_CDROM_MEDIA_DVD_R / _DVD_R_DL / _DVD_RW
+#   ID_CDROM_MEDIA_DVD_PLUS_R / _DVD_PLUS_R_DL / _DVD_PLUS_RW
+#   ID_CDROM_MEDIA_DVD_RAM
+# Burned DVDs (e.g. small-press box sets) often report only the recordable
+# subtype, never the bare ID_CDROM_MEDIA_DVD=1, so we accept any of them.
+elif echo "$disc_info" | grep -qE 'ID_CDROM_MEDIA_DVD(_[A-Z_]+)?=1'; then
     is_dvd=true
-    log "Detected: DVD disc"
+    log "Detected: DVD disc (udev reports DVD media)"
+    update_status "ripping" "DVD" "" "Detecting..."
+# Filesystem fallback: some no-name DVD+R DL writers don't set any
+# ID_CDROM_MEDIA_DVD* property at all. If the disc has a UDF/ISO filesystem
+# labelled DVDVIDEO (or a VIDEO_TS path is present) treat it as a DVD.
+elif echo "$disc_info" | grep -qE 'ID_FS_LABEL(_ENC)?=DVDVIDEO|ID_FS_LABEL(_ENC)?=DVD_VIDEO'; then
+    is_dvd=true
+    log "Detected: DVD disc (filesystem label DVDVIDEO; udev didn't flag DVD media)"
     update_status "ripping" "DVD" "" "Detecting..."
 elif echo "$disc_info" | grep -q "ID_CDROM_MEDIA_CD=1"; then
     if echo "$disc_info" | grep -q "ID_CDROM_MEDIA_TRACK_COUNT_AUDIO"; then
@@ -800,6 +815,7 @@ elif echo "$disc_info" | grep -q "ID_CDROM_MEDIA_CD=1"; then
     fi
 else
     log "Unknown or empty disc type, skipping."
+    log "DEBUG: udev properties: $(echo "$disc_info" | grep -E '^ID_(CDROM_MEDIA|FS_)' | tr '\n' ' ')"
     exit 0
 fi
 
