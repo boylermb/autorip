@@ -1239,21 +1239,264 @@ def review_lookup():
     })
 
 
+# ---------- Unified TMDb identify helpers ----------
+
+def _sanitize_fs(name):
+    """Replace filesystem-hostile characters in a path component."""
+    return re.sub(r'[<>:"/\\|?*]', "_", (name or "")).strip()
+
+
+def _tmdb_get(path, api_key, timeout=15):
+    """GET a TMDb API endpoint and return parsed JSON, or None on failure."""
+    import urllib.request
+    import urllib.error
+    sep = "&" if "?" in path else "?"
+    url = f"https://api.themoviedb.org/3{path}{sep}api_key={api_key}"
+    req = urllib.request.Request(url, headers={"User-Agent": "autorip/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
+        return None
+
+
+def _fetch_tmdb_poster(item_dir, poster_path):
+    """Download a TMDb poster into item_dir/cover.jpg if missing.  Returns bool."""
+    if not poster_path:
+        return False
+    has_art = any(
+        os.path.isfile(os.path.join(item_dir, n))
+        for n in ("cover.jpg", "cover.png", "folder.jpg")
+    )
+    if has_art:
+        return False
+    import urllib.request
+    import urllib.error
+    poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}"
+    req = urllib.request.Request(poster_url, headers={"User-Agent": "autorip/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            with open(os.path.join(item_dir, "cover.jpg"), "wb") as out:
+                out.write(resp.read())
+        return True
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+        return False
+
+
+def _move_unreviewed_item(old_item_dir, new_rel):
+    """Move an unreviewed item dir to UNREVIEWED_DIR/<new_rel>.
+
+    Handles the common case where the destination already exists (e.g. a
+    later disc of an existing season) by merging files in.  Cleans up
+    empty parent dirs (notably the per-disc _pending/_unmatched label
+    folder).  Returns the actual final dir path.
+    """
+    if not new_rel:
+        return old_item_dir
+    new_item_dir = os.path.join(UNREVIEWED_DIR, new_rel)
+    if os.path.normpath(new_item_dir) == os.path.normpath(old_item_dir):
+        return old_item_dir
+    os.makedirs(os.path.dirname(new_item_dir) or UNREVIEWED_DIR, exist_ok=True)
+    if os.path.exists(new_item_dir):
+        # Merge: move each file in, suffixing on collision so we never
+        # silently overwrite an existing reviewed file.
+        for fname in os.listdir(old_item_dir):
+            src = os.path.join(old_item_dir, fname)
+            dst = os.path.join(new_item_dir, fname)
+            if os.path.exists(dst):
+                base, ext = os.path.splitext(fname)
+                dst = os.path.join(new_item_dir, f"{base}.{int(_time.time())}{ext}")
+            try:
+                os.rename(src, dst)
+            except OSError:
+                pass
+        try:
+            os.rmdir(old_item_dir)
+        except OSError:
+            pass
+    else:
+        os.rename(old_item_dir, new_item_dir)
+    # Best-effort: prune empty parent folders so /_pending/<label>/ goes away.
+    parent = os.path.dirname(old_item_dir)
+    while (
+        parent and parent != UNREVIEWED_DIR
+        and parent.startswith(UNREVIEWED_DIR + os.sep)
+    ):
+        try:
+            os.rmdir(parent)
+        except OSError:
+            break
+        parent = os.path.dirname(parent)
+    return new_item_dir
+
+
+def _identify_tv(item_dir, show_id, season_num, first_episode, api_key):
+    """TMDb-identify a TV item: rename files, fetch poster, return summary.
+
+    Returns dict: {new_rel, show_name, season, renamed, ep_count, poster_fetched, plan}
+    """
+    season_data = _tmdb_get(
+        f"/tv/{show_id}/season/{int(season_num)}", api_key
+    )
+    if not season_data:
+        return None, "TMDb season fetch failed"
+    show_data = _tmdb_get(f"/tv/{show_id}", api_key) or {}
+    show_name = (show_data.get("name") or "").strip()
+    if not show_name:
+        return None, "TMDb show has no name"
+    ep_names = {
+        ep["episode_number"]: ep["name"]
+        for ep in season_data.get("episodes", [])
+        if "episode_number" in ep and "name" in ep
+    }
+    if not ep_names:
+        return None, "TMDb season has no episodes"
+
+    # Pick the .mkv files in their existing on-disk order so what the
+    # reviewer just previewed lines up with the renumber.  Sort by any
+    # existing SxxEyy first, then by filename.
+    sxxeyy_re = re.compile(r"S(\d{2,3})E(\d{2,3})", re.IGNORECASE)
+
+    def _key(name):
+        m = sxxeyy_re.search(name)
+        return (int(m.group(2)) if m else 9999, name.lower())
+
+    mkvs = sorted(
+        [f for f in os.listdir(item_dir) if f.lower().endswith(".mkv")],
+        key=_key,
+    )
+    safe_show = _sanitize_fs(show_name)
+
+    # Two-phase rename via .renumber- prefix to dodge same-disc collisions.
+    plan = []
+    for i, fname in enumerate(mkvs):
+        ep = first_episode + i
+        title = ep_names.get(ep, "")
+        if title:
+            new_name = (
+                f"{safe_show} - S{int(season_num):02d}E{ep:02d} - "
+                f"{_sanitize_fs(title)}.mkv"
+            )
+        else:
+            new_name = f"{safe_show} - S{int(season_num):02d}E{ep:02d}.mkv"
+        plan.append((fname, new_name, ep, title))
+
+    staged = []
+    for fname, _new, _ep, _t in plan:
+        tmp = f".renumber-{os.getpid()}-{fname}"
+        os.rename(os.path.join(item_dir, fname), os.path.join(item_dir, tmp))
+        staged.append((tmp, _new))
+
+    renamed = []
+    for tmp, new in staged:
+        os.rename(os.path.join(item_dir, tmp), os.path.join(item_dir, new))
+        renamed.append(new)
+
+    poster_fetched = _fetch_tmdb_poster(item_dir, season_data.get("poster_path")
+                                        or show_data.get("poster_path"))
+
+    new_rel = os.path.join(
+        "Video", "TV", safe_show, f"Season {int(season_num):02d}"
+    )
+    return {
+        "new_rel": new_rel,
+        "show_name": show_name,
+        "season": int(season_num),
+        "first_episode": first_episode,
+        "renamed": renamed,
+        "ep_count": len(renamed),
+        "poster_fetched": poster_fetched,
+        "plan": plan,
+    }, None
+
+
+def _identify_movie(item_dir, movie_id, api_key):
+    """TMDb-identify a movie item: rename main file, fetch poster.
+
+    Returns dict: {new_rel, title, year, renamed, poster_fetched}
+    Multi-title discs (common when the disc label was generic, so the
+    worker exported every long title MakeMKV found) are handled by
+    keeping the largest .mkv as the canonical movie file and renaming
+    the rest to "<Title> (Year) - extra-NN.mkv" so the reviewer can
+    identify and reject the wrong ones via per-file preview.
+    """
+    movie_data = _tmdb_get(f"/movie/{movie_id}", api_key)
+    if not movie_data:
+        return None, "TMDb movie fetch failed"
+    title = (movie_data.get("title") or "").strip()
+    if not title:
+        return None, "TMDb movie has no title"
+    release = movie_data.get("release_date") or ""
+    year = release[:4] if len(release) >= 4 and release[:4].isdigit() else ""
+    safe_title = _sanitize_fs(title)
+    canonical_base = f"{safe_title} ({year})" if year else safe_title
+
+    # Sort .mkv files by size descending so the longest = main feature.
+    mkvs = [f for f in os.listdir(item_dir) if f.lower().endswith(".mkv")]
+    mkvs.sort(
+        key=lambda f: os.path.getsize(os.path.join(item_dir, f)),
+        reverse=True,
+    )
+
+    # Stage via tmp prefix to avoid same-disc collisions.
+    staged = []
+    for i, fname in enumerate(mkvs):
+        if i == 0:
+            new_name = f"{canonical_base}.mkv"
+        else:
+            new_name = f"{canonical_base} - extra-{i:02d}.mkv"
+        tmp = f".rename-{os.getpid()}-{fname}"
+        os.rename(os.path.join(item_dir, fname), os.path.join(item_dir, tmp))
+        staged.append((tmp, new_name))
+    renamed = []
+    for tmp, new in staged:
+        os.rename(os.path.join(item_dir, tmp), os.path.join(item_dir, new))
+        renamed.append(new)
+
+    poster_fetched = _fetch_tmdb_poster(item_dir, movie_data.get("poster_path"))
+
+    new_rel = os.path.join("Video", "Movies", canonical_base)
+    return {
+        "new_rel": new_rel,
+        "title": title,
+        "year": year,
+        "renamed": renamed,
+        "poster_fetched": poster_fetched,
+    }, None
+
+
 @app.route("/review/tmdb-lookup", methods=["POST"])
 def review_tmdb_lookup():
-    """Look up TV episode names from TMDb and rename files in an unreviewed item.
+    """Identify a video item from a TMDb URL (TV season or movie).
 
     Accepts JSON: {
-        "item_path": "Video/TV/Show/Season 08",
-        "tmdb_url": "https://www.themoviedb.org/tv/484-murder-she-wrote/season/8"
+        "item_path":     "Video/TV/_pending/<label>" or any unreviewed item,
+        "tmdb_url":      ".../tv/<id>[-slug]/season/<n>"  or  ".../movie/<id>",
+        "first_episode": 1,    # TV only, optional, default 1
+        "season":        8     # optional fallback if URL omits /season/
     }
-    Parses the TMDb show ID and season from the URL, fetches episode names,
-    and renames SxxExx files to include the episode title.
+
+    Behaviour:
+      * Detects TV vs movie from the URL.
+      * For TV: fetches show name + season episodes + poster, renames
+        every .mkv to "<Show> - SxxEyy - <Title>.mkv" starting at
+        first_episode, drops any '.proposed' suffix, then promotes the
+        directory out of _pending/_unmatched into the canonical
+        Video/TV/<Show>/Season NN/ location.  Records tv-progress so
+        the next disc auto-resumes.
+      * For movies: fetches title + year + poster, renames the largest
+        .mkv to '<Title> (Year).mkv' and any extras to
+        '<Title> (Year) - extra-NN.mkv', then promotes the dir to
+        Video/Movies/<Title> (Year)/.
+
+    Returns the new (possibly relocated) item_path so the caller can
+    refresh the UI.
     """
     if not request.is_json:
         return jsonify({"error": "JSON body required"}), 400
-    item_path = request.json.get("item_path", "").strip()
-    tmdb_url = request.json.get("tmdb_url", "").strip()
+    payload = request.json or {}
+    item_path = (payload.get("item_path") or "").strip()
+    tmdb_url = (payload.get("tmdb_url") or "").strip()
     if not item_path:
         return jsonify({"error": "Missing item_path"}), 400
     if not tmdb_url:
@@ -1262,169 +1505,193 @@ def review_tmdb_lookup():
     safe = os.path.normpath(item_path)
     if safe.startswith("..") or safe.startswith("/"):
         return jsonify({"error": "Invalid item_path"}), 400
-
     item_dir = os.path.join(UNREVIEWED_DIR, safe)
     if not os.path.isdir(item_dir):
-        # Also check the approved library
-        item_dir_lib = os.path.join(OUTPUT_BASE, safe)
-        if os.path.isdir(item_dir_lib):
-            item_dir = item_dir_lib
-        else:
-            return jsonify({"error": f"No directory at: {item_path}"}), 404
+        return jsonify({"error": f"No directory at: {item_path}"}), 404
 
-    # Parse TMDb URL: /tv/{id}/season/{num} or /tv/{id}-slug/season/{num}
-    import urllib.request
-    import urllib.error
-    tmdb_re = re.compile(
-        r"themoviedb\.org/tv/(\d+)(?:-[^/]*)?"
-        r"(?:/season/(\d+))?",
-        re.IGNORECASE,
+    api_key = (
+        _config.get("TMDB_API_KEY")
+        or os.environ.get("TMDB_API_KEY")
+        or "db972a607f2760bb19ff8bb34074b4c7"
     )
-    m = tmdb_re.search(tmdb_url)
-    if not m:
-        return jsonify({"error": "Could not parse TMDb show ID from URL"}), 400
-    show_id = m.group(1)
-    season_num = m.group(2)
 
-    # If no season in URL, try to infer from item_path
+    # Detect /tv/ vs /movie/.  Accept ID-with-slug forms and trailing path.
+    movie_m = re.search(
+        r"themoviedb\.org/movie/(\d+)", tmdb_url, re.IGNORECASE,
+    )
+    tv_m = re.search(
+        r"themoviedb\.org/tv/(\d+)(?:-[^/]*)?(?:/season/(\d+))?",
+        tmdb_url, re.IGNORECASE,
+    )
+
+    # ---------- Movie path ----------
+    if movie_m and not tv_m:
+        movie_id = movie_m.group(1)
+        result, err = _identify_movie(item_dir, movie_id, api_key)
+        if err:
+            return jsonify({"error": err}), 502
+        new_dir = _move_unreviewed_item(item_dir, result["new_rel"])
+        # Update metadata.json
+        meta_file = os.path.join(new_dir, "metadata.json")
+        if os.path.isfile(meta_file):
+            try:
+                with open(meta_file) as fh:
+                    meta = json.load(fh)
+                meta["tmdb_id"] = movie_id
+                meta["media_type"] = "movie"
+                meta["title"] = result["title"]
+                if result["year"]:
+                    meta["year"] = result["year"]
+                meta["album"] = (
+                    f"{result['title']} ({result['year']})"
+                    if result["year"] else result["title"]
+                )
+                meta["disc_title"] = meta["album"]
+                meta["tracks"] = [
+                    os.path.splitext(n)[0]
+                    for n in sorted(os.listdir(new_dir))
+                    if n.lower().endswith(".mkv")
+                ]
+                tmp = meta_file + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(meta, fh, indent=2)
+                os.replace(tmp, meta_file)
+            except (json.JSONDecodeError, OSError):
+                pass
+        bits = [
+            f"movie → '{result['title']}"
+            + (f" ({result['year']})'" if result['year'] else "'")
+        ]
+        if len(result["renamed"]) > 1:
+            bits.append(
+                f"main + {len(result['renamed']) - 1} extra(s)"
+            )
+        if result["poster_fetched"]:
+            bits.append("poster fetched")
+        return jsonify({
+            "ok": True,
+            "kind": "movie",
+            "message": "TMDb: " + ", ".join(bits),
+            "item_path": result["new_rel"],
+            "title": result["title"],
+            "year": result["year"],
+            "renamed": result["renamed"],
+            "poster_fetched": result["poster_fetched"],
+        })
+
+    # ---------- TV path ----------
+    if not tv_m:
+        return jsonify({
+            "error": "URL must be a TMDb /tv/ or /movie/ link",
+        }), 400
+    show_id = tv_m.group(1)
+    season_num = tv_m.group(2)
     if not season_num:
-        season_re = re.compile(r"[Ss]eason\s*(\d+)", re.IGNORECASE)
-        sm = season_re.search(item_path)
-        if sm:
-            season_num = sm.group(1)
-        else:
-            return jsonify({"error": "Could not determine season number"}), 400
-
-    # Use configured API key, fall back to mnamer's built-in key
-    api_key = _config.get("TMDB_API_KEY") or os.environ.get("TMDB_API_KEY") or "db972a607f2760bb19ff8bb34074b4c7"
-
-    # Fetch season data
-    api_url = f"https://api.themoviedb.org/3/tv/{show_id}/season/{season_num}?api_key={api_key}"
-    api_req = urllib.request.Request(api_url)
-    api_req.add_header("User-Agent", "autorip/1.0")
+        # Try caller-supplied season, then infer from path.
+        season_num = str(payload.get("season") or "").strip() or None
+        if not season_num:
+            sm = re.search(r"[Ss]eason\s*(\d+)", item_path)
+            if sm:
+                season_num = sm.group(1)
+        if not season_num:
+            return jsonify({
+                "error": "TV URL is missing /season/N — paste the season URL "
+                         "or include a 'season' field",
+            }), 400
     try:
-        with urllib.request.urlopen(api_req, timeout=15) as resp:
-            season_data = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        return jsonify({"error": f"TMDb API returned HTTP {e.code}"}), 502
-    except (urllib.error.URLError, OSError) as e:
-        return jsonify({"error": f"TMDb API unreachable: {e}"}), 502
+        season_num = int(season_num)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid season number"}), 400
 
-    # Build episode name lookup
-    ep_names = {}
-    for ep in season_data.get("episodes", []):
-        ep_names[ep["episode_number"]] = ep["name"]
-
-    if not ep_names:
-        return jsonify({"error": "No episodes found in TMDb season data"}), 404
-
-    # Also fetch the show details so we can update the displayed title.
-    # Pending-bucket items typically carry a raw disc label like
-    # "FUTURAMA_S4_D2" as their disc_title and need this to surface as
-    # the canonical show name in the review UI.
-    show_name = None
+    # first_episode default: 1, but accept any int 1-999.
+    first_ep_raw = payload.get("first_episode", 1)
     try:
-        show_url = f"https://api.themoviedb.org/3/tv/{show_id}?api_key={api_key}"
-        show_req = urllib.request.Request(show_url)
-        show_req.add_header("User-Agent", "autorip/1.0")
-        with urllib.request.urlopen(show_req, timeout=15) as sresp:
-            show_data = json.loads(sresp.read())
-        show_name = (show_data.get("name") or "").strip() or None
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError):
-        show_name = None
+        first_episode = int(first_ep_raw) if first_ep_raw not in (None, "") else 1
+    except (TypeError, ValueError):
+        return jsonify({"error": "first_episode must be an integer"}), 400
+    if first_episode < 1 or first_episode > 999:
+        return jsonify({"error": "first_episode out of range (1-999)"}), 400
 
-    # Rename files: match SxxExx pattern and append episode title.
-    # Accept three filename shapes produced by the TV worker:
-    #   1. "<prefix>S07E03.mkv"                       (already matched)
-    #   2. "<prefix>S07E03 - Old Title.mkv"           (re-lookup, replace title)
-    #   3. "<prefix>S07E03.proposed.mkv"              (pending bucket — drop ".proposed")
-    # In all cases we rebuild as "<prefix>S07E03 - <Episode Title>.mkv".
-    renamed_files = []
-    ep_pattern = re.compile(
-        r'^(.*S\d{2}E(\d{2}))'
-        r'((?:\s*-\s*.+?)?)'
-        r'(?:\.proposed)?'
-        r'(\.mkv)$',
-        re.IGNORECASE,
+    result, err = _identify_tv(
+        item_dir, show_id, season_num, first_episode, api_key,
     )
-    for fname in sorted(os.listdir(item_dir)):
-        fm = ep_pattern.match(fname)
-        if not fm:
-            continue
-        ep_num = int(fm.group(2))
-        ep_title = ep_names.get(ep_num)
-        if not ep_title:
-            continue
-        # Sanitize title for filesystem
-        safe_title = re.sub(r'[<>:"/\\|?*]', '_', ep_title).strip()
-        new_name = f"{fm.group(1)} - {safe_title}{fm.group(4)}"
-        if new_name != fname:
-            old_fp = os.path.join(item_dir, fname)
-            new_fp = os.path.join(item_dir, new_name)
-            if os.path.isfile(old_fp) and not os.path.exists(new_fp):
-                os.rename(old_fp, new_fp)
-                renamed_files.append({"old": fname, "new": new_name})
+    if err:
+        return jsonify({"error": err}), 502
 
-    # Update metadata.json if present
-    meta_file = os.path.join(item_dir, "metadata.json")
+    show_name = result["show_name"]
+    new_dir = _move_unreviewed_item(item_dir, result["new_rel"])
+
+    # Update metadata.json with the canonical show name + episode list.
+    meta_file = os.path.join(new_dir, "metadata.json")
     if os.path.isfile(meta_file):
         try:
-            with open(meta_file, "r") as fh:
-                job_data = json.load(fh)
-            job_data["tmdb_id"] = show_id
-            job_data["tmdb_season"] = int(season_num)
-            # Surface the canonical show name in the review UI.  The card
-            # title falls back through album → disc_title → meta.disc_title,
-            # so writing both keeps existing items in sync regardless of
-            # which one was previously populated by the worker.
-            if show_name:
-                job_data["show"] = show_name
-                job_data["disc_title"] = show_name
-                job_data.setdefault("album", show_name)
-            # Update tracks list with episode names
-            tracks = []
-            for fname in sorted(os.listdir(item_dir)):
-                if fname.endswith(".mkv"):
-                    tracks.append(os.path.splitext(fname)[0])
-            job_data["tracks"] = tracks
+            with open(meta_file) as fh:
+                meta = json.load(fh)
+            meta["tmdb_id"] = show_id
+            meta["tmdb_season"] = int(season_num)
+            meta["tv_show"] = show_name
+            meta["tv_season"] = int(season_num)
+            meta["tv_first_episode"] = first_episode
+            meta["media_type"] = "tv"
+            meta["show"] = show_name
+            meta["album"] = f"{show_name} — Season {int(season_num):02d}"
+            meta["disc_title"] = show_name
+            meta["tracks"] = [
+                os.path.splitext(n)[0]
+                for n in sorted(os.listdir(new_dir))
+                if n.lower().endswith(".mkv")
+            ]
             tmp = meta_file + ".tmp"
             with open(tmp, "w") as fh:
-                json.dump(job_data, fh, indent=2)
+                json.dump(meta, fh, indent=2)
             os.replace(tmp, meta_file)
         except (json.JSONDecodeError, OSError):
             pass
 
-    # Also fetch show poster as cover art if missing
-    art_fetched = False
-    has_art = any(
-        os.path.isfile(os.path.join(item_dir, n))
-        for n in ("cover.jpg", "cover.png", "folder.jpg")
-    )
-    if not has_art:
-        poster_path = season_data.get("poster_path")
-        if poster_path:
-            poster_url = f"https://image.tmdb.org/t/p/w300{poster_path}"
-            poster_req = urllib.request.Request(poster_url)
-            poster_req.add_header("User-Agent", "autorip/1.0")
-            try:
-                with urllib.request.urlopen(poster_req, timeout=15) as poster_resp:
-                    with open(os.path.join(item_dir, "cover.jpg"), "wb") as out:
-                        out.write(poster_resp.read())
-                    art_fetched = True
-            except (urllib.error.URLError, OSError):
-                pass
+    # Record disc in tv-progress so the next disc auto-resumes.
+    progress_path = None
+    disc_num = None
+    try:
+        with open(meta_file) as fh:
+            _meta = json.load(fh)
+        disc_num = _meta.get("tv_disc") or _meta.get("disc")
+        # Last-ditch: parse from the original item_path label, e.g.
+        # "FUTURAMA_S4_D2" -> disc 2.
+        if not disc_num:
+            dm = re.search(r"D(\d+)\b", item_path, re.IGNORECASE)
+            if dm:
+                disc_num = int(dm.group(1))
+    except (OSError, json.JSONDecodeError):
+        pass
+    if disc_num:
+        try:
+            progress_path = _tv_progress_record(
+                show_name, season_num, disc_num, first_episode,
+                result["ep_count"],
+            )
+        except OSError:
+            progress_path = None
 
-    msg_bits = [f"renamed {len(renamed_files)} file(s)"]
-    if show_name:
-        msg_bits.append(f"title → '{show_name}'")
-    if art_fetched:
-        msg_bits.append("poster fetched")
+    bits = [
+        f"show → '{show_name}'",
+        f"S{int(season_num):02d}E{first_episode:02d}+{result['ep_count'] - 1}",
+    ]
+    if result["poster_fetched"]:
+        bits.append("poster fetched")
+    if progress_path:
+        bits.append(f"disc {disc_num} progress saved")
     return jsonify({
         "ok": True,
-        "message": "TMDb: " + ", ".join(msg_bits),
-        "renamed_files": renamed_files,
-        "episode_names": ep_names,
+        "kind": "tv",
+        "message": "TMDb: " + ", ".join(bits),
+        "item_path": result["new_rel"],
         "show_name": show_name,
+        "season": int(season_num),
+        "first_episode": first_episode,
+        "renamed": result["renamed"],
+        "ep_count": result["ep_count"],
+        "poster_fetched": result["poster_fetched"],
+        "progress_state_path": progress_path,
     })
 
 
