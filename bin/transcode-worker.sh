@@ -565,9 +565,46 @@ EOF
 }
 
 # ---------- Movie rename (single file, mnamer) ----------
+
+# Generic / placeholder volume labels that carry no real movie identity.
+# When MakeMKV cannot read a real disc title, the volume label leaks
+# through (e.g. "DVDVIDEO", "BDMV", "UNTITLED").  Letting mnamer guess
+# from the filename in these cases produces nonsense matches against
+# whatever short token appears in the temp filename, so we route these
+# to a `_pending/` bucket for manual identification instead.
+is_generic_disc_title() {
+    local t
+    t=$(echo "${1:-}" | tr '[:lower:]' '[:upper:]' | tr -d ' _-')
+    case "$t" in
+        ""|DVDVIDEO|DVD|BDMV|BDROM|BLURAY|UNTITLED|UNKNOWN|NEWVOLUME|LOGICALVOLUMEID|NONAME|MOVIE|VIDEOTS|AUDIOCD)
+            return 0 ;;
+    esac
+    # Single-letter / very short labels are almost certainly junk too.
+    [ "${#t}" -le 2 ] && return 0
+    return 1
+}
+
+# Sanitize a disc title for safe use as a filename component.
+sanitize_for_filename() {
+    echo "${1:-disc}" | tr -c '[:alnum:]._-' '_' | sed 's/__*/_/g; s/^_//; s/_$//'
+}
+
 movie_rename_file() {
     local mkv="$1"
     local disc_title="$2"
+
+    # If the volume label is a generic placeholder (DVDVIDEO, BDMV, blank,
+    # …), don't let mnamer guess — auto-matches against gibberish like
+    # "Mnamer-Copy" produce bogus library entries that look "verified".
+    # Park the file in a per-disc `_pending/` folder for manual ID.
+    if is_generic_disc_title "$disc_title"; then
+        local pending_label="${MOVIE_PENDING_LABEL:-${HOSTNAME}-${disc_title:-unknown}-$(date +%s)}"
+        local pending_dir="$UNREVIEWED_MOVIES/_pending/$pending_label"
+        mkdir -p "$pending_dir"
+        mv -f "$mkv" "$pending_dir/"
+        log "Movie disc (pending review — generic title '$disc_title'): $(basename "$mkv") → _pending/$pending_label/"
+        return
+    fi
 
     if ! command -v mnamer >/dev/null 2>&1; then
         log "mnamer not installed — using fallback"
@@ -575,11 +612,17 @@ movie_rename_file() {
         return
     fi
 
-    # Move to a temp file so mnamer can move it into the unreviewed dir
-    local tmp_copy="${mkv%.mkv}.mnamer-copy.mkv"
+    # Move to a temp file named after the disc title (NOT after a literal
+    # like "mnamer-copy") so mnamer's filename-based search uses the real
+    # disc identity instead of the temp suffix.
+    local safe_title
+    safe_title=$(sanitize_for_filename "$disc_title")
+    local tmp_dir
+    tmp_dir=$(dirname "$mkv")
+    local tmp_copy="${tmp_dir}/${safe_title}.$$.tmp.mkv"
     mv -f "$mkv" "$tmp_copy"
 
-    log "Running mnamer for movie file: $(basename "$mkv")"
+    log "Running mnamer for movie file: $(basename "$mkv") (search hint: $safe_title)"
     if mnamer --batch \
         --media=movie \
         --movie-api=tmdb \
@@ -889,6 +932,10 @@ process_job() {
     log "Processing job: $job_name"
     update_worker_status "transcoding" "$job_file" "Reading job..."
 
+    # Reset per-job movie-pending label so generic-titled discs in
+    # different jobs don't collide into the same _pending/ folder.
+    unset MOVIE_PENDING_LABEL
+
     # Parse job JSON (minimal — use grep/sed, no jq dependency)
     local disc_title disc_title_human disc_type source_host title_count is_uhd staging_dir
     disc_title=$(grep -oP '"disc_title"\s*:\s*"\K[^"]+' "$job_file" || echo "")
@@ -1104,6 +1151,15 @@ process_job() {
             tv_rename_file "$fp" "$tidx"
         else
             log "Movie disc: $disc_title"
+            # Stable per-disc pending label so all titles from a generic
+            # (DVDVIDEO/BDMV) disc end up in one _pending/ folder rather
+            # than one folder per title.
+            if [ -z "${MOVIE_PENDING_LABEL:-}" ]; then
+                local _safe_dt
+                _safe_dt=$(sanitize_for_filename "${disc_title:-unknown}")
+                MOVIE_PENDING_LABEL="${source_host:-unknown}-${_safe_dt}-$(date +%Y%m%d-%H%M%S)"
+                export MOVIE_PENDING_LABEL
+            fi
             movie_rename_file "$fp" "$disc_title"
         fi
     done
@@ -1141,6 +1197,9 @@ process_job() {
         local season_dir
         season_dir=$(printf "Season %02d" "$TV_SEASON")
         unreviewed_dest="$UNREVIEWED_TV/$TV_SHOW/$season_dir"
+    elif [ -n "${MOVIE_PENDING_LABEL:-}" ]; then
+        # Generic movie disc routed to _pending for manual identification
+        unreviewed_dest="$UNREVIEWED_MOVIES/_pending/$MOVIE_PENDING_LABEL"
     else
         # For movies, find where mnamer/fallback placed files
         # Use the last file's parent directory
