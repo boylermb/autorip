@@ -29,7 +29,141 @@ import subprocess
 import glob
 from flask import Flask, jsonify, request, send_file, abort
 
+# ---------- Structured logging ----------
+# autorip-agent emits two log streams:
+#   1. Plain text on stdout, captured by systemd/journald (and visible
+#      with `journalctl -u autorip-agent -f`).
+#   2. One JSON object per line appended to /var/log/autorip/agent.jsonl,
+#      tailed by Promtail and shipped to Loki for cross-host correlation
+#      with the rip-script and transcode-worker logs.
+#
+# The schema mirrors lib/log.sh so a single Loki query can join records
+# from every component.
+import logging
+import logging.handlers
+import socket
+import time as _time
+
+
+class _AutoripJSONFormatter(logging.Formatter):
+    """Emit a single JSON object per log record matching lib/log.sh's schema."""
+
+    _SERVICE = "autorip-agent"
+    _HOST = socket.gethostname()
+    _RESERVED = {
+        "name", "msg", "args", "levelname", "levelno", "pathname",
+        "filename", "module", "exc_info", "exc_text", "stack_info",
+        "lineno", "funcName", "created", "msecs", "relativeCreated",
+        "thread", "threadName", "processName", "process", "message",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": _time.strftime(
+                "%Y-%m-%dT%H:%M:%S", _time.gmtime(record.created)
+            ) + f".{int(record.msecs):03d}Z",
+            "level": record.levelname.lower(),
+            "host": self._HOST,
+            "service": self._SERVICE,
+            "msg": record.getMessage(),
+        }
+        # Allow callers to attach extra fields:
+        #   logger.info("msg", extra={"device": "sr0", "job_id": "..."})
+        for key, value in record.__dict__.items():
+            if key in self._RESERVED or key.startswith("_"):
+                continue
+            if value in (None, ""):
+                continue
+            payload[key] = value
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str, separators=(",", ":"))
+
+
+def _configure_logging() -> logging.Logger:
+    """Set up dual stdout + JSON-file logging for the agent + werkzeug."""
+    log_dir = os.environ.get("AUTORIP_LOG_DIR", "/var/log/autorip")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError:
+        log_dir = "/tmp"
+
+    root = logging.getLogger()
+    # Avoid double-config when imported twice (gunicorn workers, tests).
+    if getattr(root, "_autorip_configured", False):
+        return logging.getLogger("autorip.agent")
+    root.setLevel(os.environ.get("AUTORIP_LOG_LEVEL", "INFO").upper())
+
+    # ---- Human-readable stdout (journald via systemd) ----
+    stdout_h = logging.StreamHandler()
+    stdout_h.setFormatter(logging.Formatter(
+        "%(asctime)s [autorip-agent] %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    root.addHandler(stdout_h)
+
+    # ---- JSON sidecar for Promtail/Loki ----
+    try:
+        json_h = logging.handlers.WatchedFileHandler(
+            os.path.join(log_dir, "agent.jsonl")
+        )
+        json_h.setFormatter(_AutoripJSONFormatter())
+        root.addHandler(json_h)
+    except OSError:
+        # Disk full / permission denied - keep going on stdout only.
+        pass
+
+    # Keep Flask/Werkzeug noise at WARN unless the operator opts in.
+    logging.getLogger("werkzeug").setLevel(
+        os.environ.get("AUTORIP_HTTP_LOG_LEVEL", "WARNING").upper()
+    )
+    root._autorip_configured = True  # type: ignore[attr-defined]
+    return logging.getLogger("autorip.agent")
+
+
+_log = _configure_logging()
+
 app = Flask(__name__)
+
+
+@app.before_request
+def _log_request_start() -> None:
+    request.environ["_autorip_t0"] = _time.monotonic()
+
+
+@app.after_request
+def _log_request_end(response):
+    t0 = request.environ.get("_autorip_t0")
+    duration_ms = int((_time.monotonic() - t0) * 1000) if t0 else None
+    # 4xx/5xx logged at WARN, everything else at INFO.
+    level = logging.WARNING if response.status_code >= 400 else logging.INFO
+    _log.log(
+        level,
+        "%s %s -> %d",
+        request.method,
+        request.path,
+        response.status_code,
+        extra={
+            "stage": "http",
+            "method": request.method,
+            "path": request.path,
+            "status": response.status_code,
+            "remote": request.remote_addr or "",
+            "duration_ms": duration_ms,
+        },
+    )
+    return response
+
+
+@app.errorhandler(Exception)
+def _log_unhandled(exc):  # pragma: no cover - defensive
+    # Let Werkzeug HTTP exceptions (404, 405, etc.) keep their own status.
+    from werkzeug.exceptions import HTTPException
+    if isinstance(exc, HTTPException):
+        return exc
+    _log.exception("Unhandled exception in %s %s", request.method, request.path,
+                   extra={"stage": "http", "path": request.path})
+    return jsonify({"error": "internal server error"}), 500
 
 # ---------- Load configuration from shell-style config file ----------
 def load_config(path=None):
@@ -1653,4 +1787,7 @@ def health():
 
 
 if __name__ == "__main__":
+    _log.info("autorip-agent starting", extra={
+        "stage": "startup", "port": AGENT_PORT, "output_base": OUTPUT_BASE,
+    })
     app.run(host="0.0.0.0", port=AGENT_PORT, debug=False)

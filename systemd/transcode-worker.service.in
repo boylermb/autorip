@@ -11,6 +11,7 @@ Group=autorip
 Environment=HOME=/var/lib/autorip
 StandardOutput=append:/var/log/autorip/transcode-worker.log
 StandardError=append:/var/log/autorip/transcode-worker.log
+SyslogIdentifier=autorip-transcode-worker
 
 # Grant GPU access
 SupplementaryGroups=video render

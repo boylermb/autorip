@@ -49,6 +49,10 @@ source "$AUTORIP_CONF"
 # Look in install location first, then alongside this script (dev mode).
 _SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 for _libdir in /usr/local/lib/autorip "$_SELF_DIR/lib"; do
+    if [ -f "$_libdir/log.sh" ]; then
+        # shellcheck source=lib/log.sh
+        source "$_libdir/log.sh"
+    fi
     if [ -f "$_libdir/tmdb.sh" ]; then
         # shellcheck source=lib/tmdb.sh
         source "$_libdir/tmdb.sh"
@@ -94,7 +98,17 @@ EPISODES_PER_DISC="${EPISODES_PER_DISC:-4}"
 UHD_KEEP_ORIGINAL="${UHD_KEEP_ORIGINAL:-yes}"
 NNEDI3_WEIGHTS="${NNEDI3_WEIGHTS:-/usr/share/ffmpeg/nnedi3_weights.bin}"
 
-log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $LOGPREFIX $*"; }
+# ---------- Structured-logging context ----------
+# lib/log.sh (sourced above when present) reads these env vars and emits
+# them as fields on every JSON log line written to /var/log/autorip/events.jsonl.
+export AUTORIP_LOG_SERVICE="transcode-worker"
+export AUTORIP_LOG_STAGE="transcode"
+
+# Fallback log() if lib/log.sh wasn't found.  The lib defines a richer
+# version that accepts a leading level (debug|info|warn|error).
+if ! declare -F log >/dev/null 2>&1; then
+    log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $LOGPREFIX $*"; }
+fi
 
 # Escape a string for safe inclusion in a JSON value (handles \ and ")
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }

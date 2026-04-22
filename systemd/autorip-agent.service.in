@@ -13,9 +13,17 @@ ExecStart=/usr/local/bin/autorip-agent-venv/bin/gunicorn \
 Restart=on-failure
 RestartSec=5
 
+# Logging — stdout/stderr → journald (tagged for promtail), and the
+# agent itself also writes JSON to /var/log/autorip/agent.jsonl.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autorip-agent
+ReadWritePaths=/var/log/autorip /var/lib/autorip
+
 # Runs as root so it can start/stop autorip systemd services
 # The agent only listens on the local network (no public exposure)
 Environment=PYTHONUNBUFFERED=1
+Environment=AUTORIP_LOG_DIR=/var/log/autorip
 
 [Install]
 WantedBy=multi-user.target

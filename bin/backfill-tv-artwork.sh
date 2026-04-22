@@ -35,6 +35,12 @@ fi
 . "$LIB_DIR/tmdb.sh"
 # shellcheck source=lib/tv-overrides.sh
 [ -f "$LIB_DIR/tv-overrides.sh" ] && . "$LIB_DIR/tv-overrides.sh"
+# shellcheck source=lib/log.sh
+[ -f "$LIB_DIR/log.sh" ] && . "$LIB_DIR/log.sh"
+
+# Tag log lines emitted by lib/log.sh with the right service name.
+export AUTORIP_LOG_SERVICE="backfill-tv-artwork"
+export AUTORIP_LOG_STAGE="backfill"
 
 # ---------- defaults ----------
 OUTPUT_BASE="${OUTPUT_BASE:-/srv/library}"
@@ -57,11 +63,17 @@ ERRORS=0
 
 # ---------- helpers ----------
 log() {
-    [ "$QUIET" -eq 1 ] && return 0
-    printf '%s\n' "$*"
+    [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"
+    declare -F log_info >/dev/null 2>&1 && AUTORIP_LOG_JSON_ONLY=yes log_info "$*"
 }
-warn() { printf 'WARN: %s\n' "$*" >&2; }
-err()  { printf 'ERROR: %s\n' "$*" >&2; ERRORS=$((ERRORS + 1)); }
+warn() {
+    printf 'WARN: %s\n' "$*" >&2
+    declare -F log_warn >/dev/null 2>&1 && AUTORIP_LOG_JSON_ONLY=yes log_warn "$*"
+}
+err()  {
+    printf 'ERROR: %s\n' "$*" >&2; ERRORS=$((ERRORS + 1))
+    declare -F log_error >/dev/null 2>&1 && AUTORIP_LOG_JSON_ONLY=yes log_error "$*"
+}
 
 usage() {
     sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'

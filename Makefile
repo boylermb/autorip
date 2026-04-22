@@ -107,6 +107,7 @@ install-scripts:
 	install -m 0755 bin/autorip.sh $(PREFIX)/bin/autorip.sh
 	@# Shared shell libraries (sourced by autorip.sh and transcode-worker.sh)
 	mkdir -p $(PREFIX)/lib/autorip
+	install -m 0644 bin/lib/log.sh $(PREFIX)/lib/autorip/log.sh
 	install -m 0644 bin/lib/tmdb.sh $(PREFIX)/lib/autorip/tmdb.sh
 	install -m 0644 bin/lib/tv-progress.sh $(PREFIX)/lib/autorip/tv-progress.sh
 	install -m 0644 bin/lib/tv-overrides.sh $(PREFIX)/lib/autorip/tv-overrides.sh
@@ -120,6 +121,7 @@ install-scripts:
 		echo "    Preserved existing $(SYSCONFDIR)/autorip/tv-overrides.json"; \
 	fi
 	@echo "    Installed $(PREFIX)/bin/autorip.sh"
+	@echo "    Installed $(PREFIX)/lib/autorip/log.sh"
 	@echo "    Installed $(PREFIX)/lib/autorip/tmdb.sh"
 	@echo "    Installed $(PREFIX)/lib/autorip/tv-progress.sh"
 	@echo "    Installed $(PREFIX)/lib/autorip/tv-overrides.sh"
@@ -131,8 +133,18 @@ install-services: configure-services
 	install -m 0644 build/autorip@.service $(SYSTEMDDIR)/autorip@.service
 	@# Log & state directories
 	mkdir -p /var/log/autorip /var/lib/autorip /var/lib/autorip/.MakeMKV
-	@# Logrotate
-	@echo '/var/log/autorip/*.log {\n  weekly\n  rotate 4\n  compress\n  missingok\n  notifempty\n}' > $(SYSCONFDIR)/logrotate.d/autorip
+	@# Logrotate (covers per-device .log files AND the JSON event sidecars
+	@# tailed by Promtail/Loki — see docs/LOGGING.md).
+	@printf '%s\n' \
+	    '/var/log/autorip/*.log /var/log/autorip/*.jsonl {' \
+	    '  weekly' \
+	    '  rotate 4' \
+	    '  compress' \
+	    '  delaycompress' \
+	    '  missingok' \
+	    '  notifempty' \
+	    '  copytruncate' \
+	    '}' > $(SYSCONFDIR)/logrotate.d/autorip
 	@# abcde config
 	install -m 0644 build/abcde.conf $(SYSCONFDIR)/abcde.conf
 	@# MakeMKV settings
@@ -160,6 +172,7 @@ install-worker: configure-services
 	install -m 0755 bin/backfill-tv-artwork.sh $(PREFIX)/bin/backfill-tv-artwork.sh
 	@# Shared shell libraries (in case install-scripts wasn't run on this node)
 	mkdir -p $(PREFIX)/lib/autorip
+	install -m 0644 bin/lib/log.sh $(PREFIX)/lib/autorip/log.sh
 	install -m 0644 bin/lib/tmdb.sh $(PREFIX)/lib/autorip/tmdb.sh
 	install -m 0644 bin/lib/tv-progress.sh $(PREFIX)/lib/autorip/tv-progress.sh
 	install -m 0644 bin/lib/tv-overrides.sh $(PREFIX)/lib/autorip/tv-overrides.sh

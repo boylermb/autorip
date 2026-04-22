@@ -40,6 +40,10 @@ source "$AUTORIP_CONF"
 # Look in install location first, then alongside this script (dev mode).
 _SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 for _libdir in /usr/local/lib/autorip "$_SELF_DIR/lib"; do
+    if [ -f "$_libdir/log.sh" ]; then
+        # shellcheck source=lib/log.sh
+        source "$_libdir/log.sh"
+    fi
     if [ -f "$_libdir/tmdb.sh" ]; then
         # shellcheck source=lib/tmdb.sh
         source "$_libdir/tmdb.sh"
@@ -49,6 +53,18 @@ done
 
 DEVICE="${1:?Usage: autorip.sh /dev/srX}"
 LOGPREFIX="[autorip $(basename "$DEVICE")]"
+
+# ---------- Structured-logging context ----------
+# These env vars are read by lib/log.sh (when available) and emitted as
+# fields on every JSON log line so Loki can group/filter by host+device+job.
+export AUTORIP_LOG_SERVICE="autorip"
+export AUTORIP_LOG_DEVICE
+AUTORIP_LOG_DEVICE=$(basename "$DEVICE")
+export AUTORIP_LOG_STAGE="rip"
+if command -v autorip_log_new_job_id >/dev/null 2>&1; then
+    export AUTORIP_LOG_JOB_ID
+    AUTORIP_LOG_JOB_ID=$(autorip_log_new_job_id "$AUTORIP_LOG_DEVICE")
+fi
 
 # Output directories (derived from config)
 MOVIES_DIR="$OUTPUT_BASE/Video/Movies"
@@ -68,7 +84,14 @@ MIN_TITLE_SECONDS="${MIN_TITLE_SECONDS:-0}"
 EPISODES_PER_DISC="${EPISODES_PER_DISC:-4}"
 UHD_KEEP_ORIGINAL="${UHD_KEEP_ORIGINAL:-yes}"
 
-log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $LOGPREFIX $*"; }
+# If lib/log.sh was sourced above it has already defined a richer `log` that
+# accepts an optional level (debug|info|warn|error) as the first arg and
+# emits a JSON sidecar to /var/log/autorip/events.jsonl.  When the lib is
+# missing (e.g. running from a tarball without `make install`) fall back to
+# this minimal stdout-only implementation so the script still works.
+if ! declare -F log >/dev/null 2>&1; then
+    log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $LOGPREFIX $*"; }
+fi
 
 # Escape a string for safe inclusion in a JSON value (handles \ and ")
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
@@ -89,6 +112,17 @@ update_status() {
     if [ -f "$STATUS_DIR/cover-$(basename "$DEVICE").jpg" ]; then
         has_art="true"
     fi
+    # Propagate the latest disc_type / title onto the log context so JSON
+    # log lines emitted between status updates are tagged consistently.
+    [ -n "$disc_type" ] && export AUTORIP_LOG_DISC_TYPE="$disc_type"
+    [ -n "$title" ]     && export AUTORIP_LOG_TITLE="$title"
+    case "$status" in
+        ripping)        export AUTORIP_LOG_STAGE="rip" ;;
+        transcoding)    export AUTORIP_LOG_STAGE="transcode" ;;
+        renaming)       export AUTORIP_LOG_STAGE="rename" ;;
+        complete|done)  export AUTORIP_LOG_STAGE="complete" ;;
+        error)          export AUTORIP_LOG_STAGE="error" ;;
+    esac
     mkdir -p "$STATUS_DIR"
     # Escape user-supplied strings for safe JSON embedding
     local s_title s_artist s_album s_disc_type s_progress s_current_track
