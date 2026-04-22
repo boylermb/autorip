@@ -999,7 +999,12 @@ rip_video_disc() {
 
     log "Found $TITLE_COUNT title(s) to rip: ${TITLE_IDS[*]}"
 
-    OUTPUT_DIR="$STAGING_DIR/$DISC_TITLE"
+    # Per-host staging suffix prevents collisions when two different
+    # physical discs share the same volume label (e.g. multiple
+    # "DVDVIDEO" DVDs ripping simultaneously on different hosts —
+    # without the suffix they'd both write to STAGING_DIR/DVDVIDEO/
+    # and clobber each other's title files).
+    OUTPUT_DIR="$STAGING_DIR/${DISC_TITLE}-$(hostname -s)-$$"
     mkdir -p "$OUTPUT_DIR"
 
     # Collect title_index:file_path entries for the single disc job
