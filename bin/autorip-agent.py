@@ -1183,6 +1183,7 @@ def review_lookup():
         f for f in os.listdir(item_dir)
         if f != "metadata.json" and not f.endswith(".tmp")
     )
+    final_names = []  # filename-after-rename, in track order, for retagging
     for i, track_name in enumerate(tracks):
         if i >= len(existing_files):
             break
@@ -1198,6 +1199,65 @@ def review_lookup():
             if os.path.isfile(old_fp) and not os.path.exists(new_fp):
                 os.rename(old_fp, new_fp)
                 renamed_files.append({"old": old_name, "new": new_name})
+                final_names.append(new_name)
+            else:
+                final_names.append(old_name)
+        else:
+            final_names.append(old_name)
+
+    # Rewrite ID3 / Vorbis tags so Navidrome / Symphonium pick up the
+    # new artist + album + title.  Without this the directory says
+    # "Stevie Wonder/Songs in the Key of Life" but the embedded tags
+    # still say "Unknown Artist / Unknown Album (xxxxx)" from the
+    # original abcde rip, and library scanners group by tag not path.
+    retagged = 0
+    retag_errors = []
+    total_tracks = len(matched_medium.get("tracks", [])) if matched_medium else len(tracks)
+    for i, fname in enumerate(final_names):
+        if i >= len(tracks):
+            break
+        fp = os.path.join(item_dir, fname)
+        if not os.path.isfile(fp):
+            continue
+        ext = os.path.splitext(fname)[1].lower()
+        title = tracks[i]
+        track_no = f"{i + 1}/{total_tracks}" if total_tracks else str(i + 1)
+        try:
+            if ext == ".mp3":
+                # Use mid3v2 (mutagen) — it handles UTF-8 cleanly.
+                subprocess.run(
+                    ["mid3v2",
+                     "--artist", artist,
+                     "--album", album,
+                     "--song", title,
+                     "--track", track_no,
+                     "--TPOS", f"{disc_number}/{disc_total}" if disc_total > 1 else "1/1",
+                     fp],
+                    check=True, capture_output=True, timeout=15,
+                )
+                retagged += 1
+            elif ext in (".flac", ".ogg", ".opus"):
+                # metaflac for FLAC, vorbiscomment for ogg/opus.
+                tool = "metaflac" if ext == ".flac" else "vorbiscomment"
+                if ext == ".flac":
+                    subprocess.run(["metaflac",
+                                    "--remove-tag=ARTIST",
+                                    "--remove-tag=ALBUM",
+                                    "--remove-tag=TITLE",
+                                    "--remove-tag=TRACKNUMBER",
+                                    "--remove-tag=DISCNUMBER",
+                                    "--remove-tag=DISCTOTAL",
+                                    f"--set-tag=ARTIST={artist}",
+                                    f"--set-tag=ALBUM={album}",
+                                    f"--set-tag=TITLE={title}",
+                                    f"--set-tag=TRACKNUMBER={i + 1}",
+                                    f"--set-tag=DISCNUMBER={disc_number}",
+                                    f"--set-tag=DISCTOTAL={disc_total or 1}",
+                                    fp],
+                                   check=True, capture_output=True, timeout=15)
+                    retagged += 1
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            retag_errors.append(f"{fname}: {exc}")
 
     # Move directory to Artist/Album structure
     new_rel = os.path.join("Audio", "Music", re.sub(r'[<>:"/\\|?*]', '_', artist),
@@ -1253,9 +1313,10 @@ def review_lookup():
         return jsonify({"error": f"Failed to write: {exc}"}), 500
 
     disc_suffix = f", disc {disc_number}/{disc_total}" if disc_total > 1 else ""
+    retag_suffix = f", {retagged} retagged" if retagged else ""
     return jsonify({
         "ok": True,
-        "message": f"Identified: {artist} — {album} ({len(tracks)} tracks{disc_suffix}, {len(renamed_files)} files renamed{', art fetched' if art_fetched else ''})",
+        "message": f"Identified: {artist} — {album} ({len(tracks)} tracks{disc_suffix}, {len(renamed_files)} files renamed{retag_suffix}{', art fetched' if art_fetched else ''})",
         "artist": artist,
         "album": album,
         "tracks": tracks,
@@ -1263,6 +1324,8 @@ def review_lookup():
         "disc_total": disc_total,
         "item_path": new_item_path,
         "renamed_files": renamed_files,
+        "retagged": retagged,
+        "retag_errors": retag_errors,
         "job": job_data,
     })
 
