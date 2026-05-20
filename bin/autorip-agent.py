@@ -1035,6 +1035,15 @@ def review_lookup():
         return jsonify({"error": "JSON body required"}), 400
     item_path = request.json.get("item_path", "").strip()
     mb_url = request.json.get("musicbrainz_url", "").strip()
+    user_disc_raw = request.json.get("disc_number", None)
+    user_disc = None
+    if user_disc_raw not in (None, "", 0, "0"):
+        try:
+            user_disc = int(user_disc_raw)
+            if user_disc < 1 or user_disc > 99:
+                raise ValueError
+        except (TypeError, ValueError):
+            return jsonify({"error": "disc_number must be an integer 1-99"}), 400
     if not item_path:
         return jsonify({"error": "Missing item_path"}), 400
     if not mb_url:
@@ -1110,8 +1119,24 @@ def review_lookup():
     job_track_count = len(job_data.get("tracks", []))
     matched_medium = None
 
+    # Strategy 0: caller explicitly asked for a specific disc number
+    if user_disc is not None:
+        for medium in media:
+            if int(medium.get("position", 0)) == user_disc:
+                matched_medium = medium
+                disc_number = user_disc
+                break
+        if not matched_medium:
+            avail = [int(m.get("position", 0)) for m in media if m.get("position")]
+            return jsonify({
+                "error": (
+                    f"Release has no disc #{user_disc} "
+                    f"(available: {sorted(avail) or 'none'})"
+                )
+            }), 400
+
     # Strategy 1: match by disc_id
-    if job_disc_id:
+    if not matched_medium and job_disc_id:
         for medium in media:
             for disc in medium.get("discs", []):
                 if disc.get("id") == job_disc_id:
@@ -1227,12 +1252,15 @@ def review_lookup():
     except OSError as exc:
         return jsonify({"error": f"Failed to write: {exc}"}), 500
 
+    disc_suffix = f", disc {disc_number}/{disc_total}" if disc_total > 1 else ""
     return jsonify({
         "ok": True,
-        "message": f"Identified: {artist} — {album} ({len(tracks)} tracks, {len(renamed_files)} files renamed{', art fetched' if art_fetched else ''})",
+        "message": f"Identified: {artist} — {album} ({len(tracks)} tracks{disc_suffix}, {len(renamed_files)} files renamed{', art fetched' if art_fetched else ''})",
         "artist": artist,
         "album": album,
         "tracks": tracks,
+        "disc_number": disc_number,
+        "disc_total": disc_total,
         "item_path": new_item_path,
         "renamed_files": renamed_files,
         "job": job_data,
