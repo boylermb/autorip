@@ -1,0 +1,27 @@
+# Python tools autorip shells out to (mnamer, eyeD3, discid, musicbrainzngs)
+# plus their dependencies, pinned to the set running on the cluster workers.
+#
+# Installed with `pip3 install --no-deps` into the system Python, so pip
+# never tries to upgrade a Debian-owned package (requests, packaging), which
+# it can't uninstall. Those come from apt in `make install-deps`.
+appdirs==1.4.4
+attrs==26.1.0
+babelfish==0.6.1
+cattrs==26.1.0
+deprecation==2.1.0
+discid==1.4.0
+eyeD3==0.9.9
+filetype==1.2.0
+guessit==3.8.0
+mnamer==2.6.0
+musicbrainzngs==0.7.1
+python-dateutil==2.9.0.post0
+rebulk==3.2.0
+requests-cache==0.9.8
+setuptools==82.0.1
+setuptools-scm==10.0.5
+six==1.17.0
+teletype==1.3.4
+typing_extensions==4.15.0
+url-normalize==2.2.1
+vcs-versioning==1.1.1
