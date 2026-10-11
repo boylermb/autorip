@@ -52,8 +52,9 @@ install-deps:
 		build-essential pkg-config libc6-dev libssl-dev libexpat1-dev \
 		libavcodec-dev libgl1-mesa-dev zlib1g-dev wget \
 		libdvdcss2 abcde flac lame cdparanoia id3v2 eject at ffmpeg \
-		glyrc cd-discid libdiscid0 python3 python3-pip python3-venv
-	pip3 install --break-system-packages eyed3 mnamer discid musicbrainzngs
+		glyrc cd-discid libdiscid0 python3 python3-pip python3-venv \
+		python3-requests python3-packaging
+	pip3 install --break-system-packages --no-deps -r requirements.txt
 
 # ==========================================================================
 # install-makemkv — Build from source
@@ -67,10 +68,11 @@ install-makemkv:
 		exit 0; \
 	fi
 	mkdir -p /tmp/makemkv-build
-	wget -qO /tmp/makemkv-build/makemkv-oss-$(MAKEMKV_VERSION).tar.gz \
-		"https://www.makemkv.com/download/makemkv-oss-$(MAKEMKV_VERSION).tar.gz"
-	wget -qO /tmp/makemkv-build/makemkv-bin-$(MAKEMKV_VERSION).tar.gz \
-		"https://www.makemkv.com/download/makemkv-bin-$(MAKEMKV_VERSION).tar.gz"
+	@# makemkv.com moves superseded releases to download/old/
+	for f in makemkv-oss-$(MAKEMKV_VERSION).tar.gz makemkv-bin-$(MAKEMKV_VERSION).tar.gz; do \
+		wget -qO /tmp/makemkv-build/$$f "https://www.makemkv.com/download/$$f" || \
+		wget -qO /tmp/makemkv-build/$$f "https://www.makemkv.com/download/old/$$f" || exit 1; \
+	done
 	cd /tmp/makemkv-build && tar xzf makemkv-oss-$(MAKEMKV_VERSION).tar.gz
 	cd /tmp/makemkv-build && tar xzf makemkv-bin-$(MAKEMKV_VERSION).tar.gz
 	cd /tmp/makemkv-build/makemkv-oss-$(MAKEMKV_VERSION) && \
